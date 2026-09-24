@@ -1,0 +1,16 @@
+{
+  "name": "tradelens-quote-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "WebSocket relay: one Finnhub connection fanned out to TradeLens app clients",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
