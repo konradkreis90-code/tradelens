@@ -16,6 +16,99 @@ const WebSocket = require('ws');
 const FINNHUB_KEY = process.env.FINNHUB_KEY;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY; // for /analyze (chart reading)
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-5';
+const SNAP_CLIENT_ID = process.env.SNAPTRADE_CLIENT_ID, SNAP_CONSUMER_KEY = process.env.SNAPTRADE_CONSUMER_KEY;
+const DATABASE_URL = process.env.DATABASE_URL;
+
+// ---------------------------------------------------------------------------
+// Database (Railway Postgres). One row per app install ("device account").
+// ---------------------------------------------------------------------------
+const { Pool } = require('pg');
+const db = DATABASE_URL ? new Pool({ connectionString: DATABASE_URL, ssl: DATABASE_URL.includes('railway') ? { rejectUnauthorized: false } : undefined }) : null;
+async function initDb() {
+  if (!db) { console.warn('DATABASE_URL not set; brokerage features disabled'); return; }
+  await db.query(`CREATE TABLE IF NOT EXISTS users (
+    device_id TEXT PRIMARY KEY,
+    snap_user_id TEXT, snap_user_secret TEXT, broker_name TEXT,
+    created_at TIMESTAMPTZ DEFAULT now(), connected_at TIMESTAMPTZ
+  )`);
+  console.log('db ready');
+}
+const isDeviceId = v => typeof v === 'string' && /^[a-zA-Z0-9\-]{16,64}$/.test(v);
+async function getUser(deviceId) {
+  const r = await db.query('INSERT INTO users(device_id) VALUES($1) ON CONFLICT (device_id) DO UPDATE SET device_id=EXCLUDED.device_id RETURNING *', [deviceId]);
+  return r.rows[0];
+}
+
+// ---------------------------------------------------------------------------
+// SnapTrade (read-only brokerage connections)
+// ---------------------------------------------------------------------------
+const { Snaptrade } = require('snaptrade-typescript-sdk');
+const snap = SNAP_CLIENT_ID && SNAP_CONSUMER_KEY ? new Snaptrade({ clientId: SNAP_CLIENT_ID, consumerKey: SNAP_CONSUMER_KEY }) : null;
+
+async function ensureSnapUser(user) {
+  if (user.snap_user_id && user.snap_user_secret) return user;
+  const snapUserId = 'pl_' + user.device_id;
+  const reg = await snap.authentication.registerSnapTradeUser({ userId: snapUserId });
+  const secret = reg.data.userSecret;
+  const r = await db.query('UPDATE users SET snap_user_id=$2, snap_user_secret=$3 WHERE device_id=$1 RETURNING *', [user.device_id, snapUserId, secret]);
+  return r.rows[0];
+}
+const creds = u => ({ userId: u.snap_user_id, userSecret: u.snap_user_secret });
+
+async function listPositions(user) {
+  const accts = (await snap.accountInformation.listUserAccounts(creds(user))).data || [];
+  const out = [];
+  for (const a of accts) {
+    let pos = [];
+    try { pos = (await snap.accountInformation.getUserAccountPositions({ ...creds(user), accountId: a.id })).data || []; } catch (e) { console.error('positions', a.id, e.message); }
+    for (const p of pos) {
+      const sym = p.symbol?.symbol?.symbol || p.symbol?.symbol?.raw_symbol || p.symbol?.raw_symbol || p.symbol?.symbol || null;
+      if (!sym || !(p.units > 0)) continue;
+      out.push({ symbol: String(sym).toUpperCase(), qty: p.units, avgCost: p.average_purchase_price ?? null, brokerPrice: p.price ?? null, account: a.name || a.institution_name || '' });
+    }
+  }
+  // merge same symbol across accounts
+  const merged = new Map();
+  for (const p of out) { const m = merged.get(p.symbol); if (!m) merged.set(p.symbol, { ...p }); else { const q = m.qty + p.qty; m.avgCost = m.avgCost != null && p.avgCost != null ? (m.avgCost * m.qty + p.avgCost * p.qty) / q : m.avgCost ?? p.avgCost; m.qty = q; } }
+  return { accounts: accts.map(a => ({ id: a.id, name: a.name || '', institution: a.institution_name || '' })), positions: [...merged.values()] };
+}
+
+async function listTrades(user, days = 180) {
+  const end = new Date(), start = new Date(Date.now() - days * 86400000);
+  const fmt = d => d.toISOString().slice(0, 10);
+  const acts = (await snap.transactionsAndReporting.getActivities({ ...creds(user), startDate: fmt(start), endDate: fmt(end) })).data || [];
+  const fills = acts.filter(a => ['BUY', 'SELL'].includes(String(a.type || '').toUpperCase()) && a.units && a.price)
+    .map(a => ({ symbol: String(a.symbol?.symbol || a.symbol?.raw_symbol || '').toUpperCase(), side: String(a.type).toUpperCase(), qty: Math.abs(a.units), price: a.price, date: (a.trade_date || a.settlement_date || '').slice(0, 10) }))
+    .filter(f => f.symbol).sort((x, y) => x.date < y.date ? -1 : 1);
+  // FIFO pairing into closed trades
+  const open = new Map(), closed = [];
+  for (const f of fills) {
+    const q = open.get(f.symbol) || []; 
+    if (f.side === 'BUY') { q.push({ ...f }); open.set(f.symbol, q); continue; }
+    let left = f.qty;
+    while (left > 0 && q.length) {
+      const lot = q[0]; const take = Math.min(left, lot.qty);
+      closed.push({ symbol: f.symbol, side: 'Long', qty: take, entry: lot.price, exit: f.price, entryDate: lot.date, exitDate: f.date, plPct: (f.price - lot.price) / lot.price * 100 });
+      lot.qty -= take; left -= take; if (lot.qty <= 0) q.shift();
+    }
+  }
+  return { fills, closed: closed.sort((a, b) => a.exitDate < b.exitDate ? 1 : -1).slice(0, 30) };
+}
+
+async function gradeTrades(closed) {
+  if (!ANTHROPIC_API_KEY || !closed.length) return closed.map(t => ({ ...t, grade: null, why: '' }));
+  const system = `You grade a retail trader's closed stock trades for education. For each trade give a letter grade A, B or C and a 1-2 sentence "why" in plain English that a beginner understands. Judge: was the entry at a sensible level relative to the move, was risk defined and proportionate, was the exit disciplined (took profit / cut loss) or emotional. You only know entry, exit, dates and size, so be fair about uncertainty and never invent chart details. Return ONLY JSON: {"grades":[{"i":index,"grade":"A|B|C","why":"..."}]}`;
+  const list = closed.map((t, i) => `${i}: ${t.symbol} ${t.side} ${t.qty} sh, in ${t.entry} on ${t.entryDate}, out ${t.exit} on ${t.exitDate}, P/L ${t.plPct.toFixed(1)}%`).join('\n');
+  const res = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({ model: ANTHROPIC_MODEL, max_tokens: 2000, system, messages: [{ role: 'user', content: list }] }) });
+  if (!res.ok) throw new Error('grade model ' + res.status);
+  const data = await res.json(); const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+  const j = JSON.parse(text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1));
+  const by = new Map((j.grades || []).map(g => [g.i, g]));
+  return closed.map((t, i) => ({ ...t, grade: ['A', 'B', 'C'].includes(by.get(i)?.grade) ? by.get(i).grade : null, why: String(by.get(i)?.why || '') }));
+}
+
+function json(res, code, obj) { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); }
 const PORT = process.env.PORT || 8080;
 if (!FINNHUB_KEY) { console.error('Set FINNHUB_KEY'); process.exit(1); }
 
@@ -193,6 +286,46 @@ const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Headers', 'content-type');
   if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
   const url = new URL(req.url, 'http://x');
+  // ---- brokerage routes ----
+  if (url.pathname.startsWith('/brokerage/') || url.pathname === '/me') {
+    if (!db) return json(res, 503, { error: 'database not configured' });
+    let body = {}; if (req.method === 'POST') { try { body = JSON.parse(await readBody(req, 1e6) || '{}'); } catch { return json(res, 400, { error: 'bad json' }); } }
+    const deviceId = body.deviceId || url.searchParams.get('deviceId');
+    if (!isDeviceId(deviceId)) return json(res, 400, { error: 'deviceId required' });
+    try {
+      let user = await getUser(deviceId);
+      const connected = !!user.connected_at;
+      if (url.pathname === '/me') return json(res, 200, { connected, broker: user.broker_name || null, connectedAt: user.connected_at });
+      if (!snap) return json(res, 503, { error: 'SnapTrade keys not set' });
+      if (url.pathname === '/brokerage/connect' && req.method === 'POST') {
+        user = await ensureSnapUser(user);
+        const login = await snap.authentication.loginSnapTradeUser({ ...creds(user), connectionType: 'read', ...(body.broker ? { broker: body.broker } : {}) });
+        return json(res, 200, { url: login.data.redirectURI });
+      }
+      if (url.pathname === '/brokerage/positions') {
+        if (!user.snap_user_id) return json(res, 200, { connected: false, accounts: [], positions: [] });
+        const data = await listPositions(user);
+        if (data.accounts.length && !connected) { await db.query('UPDATE users SET connected_at=now(), broker_name=$2 WHERE device_id=$1', [deviceId, data.accounts[0].institution || null]); }
+        return json(res, 200, { connected: data.accounts.length > 0, broker: data.accounts[0]?.institution || user.broker_name || null, ...data });
+      }
+      if (url.pathname === '/brokerage/trades') {
+        if (!user.snap_user_id) return json(res, 200, { closed: [] });
+        const { closed } = await listTrades(user);
+        const graded = url.searchParams.get('grade') === '1' ? await gradeTrades(closed) : closed.map(t => ({ ...t, grade: null, why: '' }));
+        return json(res, 200, { closed: graded });
+      }
+      if (url.pathname === '/brokerage/disconnect' && req.method === 'POST') {
+        if (user.snap_user_id) { try { await snap.authentication.deleteSnapTradeUser(creds(user)); } catch (e) { console.error('snap delete', e.message); } }
+        await db.query('UPDATE users SET snap_user_id=NULL, snap_user_secret=NULL, broker_name=NULL, connected_at=NULL WHERE device_id=$1', [deviceId]);
+        return json(res, 200, { ok: true });
+      }
+      return json(res, 404, { error: 'not found' });
+    } catch (e) {
+      const detail = e.response?.data ? JSON.stringify(e.response.data).slice(0, 300) : String(e.message).slice(0, 300);
+      console.error('brokerage error', url.pathname, detail);
+      return json(res, 502, { error: 'brokerage request failed', detail });
+    }
+  }
   if (url.pathname === '/analyze' && req.method === 'POST') {
     if (!ANTHROPIC_API_KEY) { res.writeHead(503, {'Content-Type':'application/json'}); return res.end('{"error":"ANTHROPIC_API_KEY not set"}'); }
     try {
@@ -246,5 +379,6 @@ setInterval(() => {
   }
 }, 30000);
 
+initDb().catch(e => console.error('db init failed', e.message));
 connectUpstream();
 server.listen(PORT, () => console.log(`relay listening on ws://localhost:${PORT}`));
