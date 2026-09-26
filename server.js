@@ -10,6 +10,9 @@
 //   <- {"type":"quote","symbol":"NBIS","price":240.15,"ts":1727180000000,"volume":100}
 //   <- {"type":"status","upstream":"connected"|"reconnecting"}
 
+// Node 18 doesn't expose Web Crypto globally; the SnapTrade SDK needs it for request signatures.
+if (!globalThis.crypto) globalThis.crypto = require('crypto').webcrypto;
+
 const http = require('http');
 const WebSocket = require('ws');
 
