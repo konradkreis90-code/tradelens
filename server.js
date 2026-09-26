@@ -83,14 +83,29 @@ async function tryChain(steps) {
   }
   throw lastErr;
 }
+const lastRefresh = new Map(); // authorizationId -> timestamp
+async function refreshConnections(user) {
+  try {
+    const auths = (await snap.connections.listBrokerageAuthorizations(creds(user))).data || [];
+    for (const a of auths) {
+      if (Date.now() - (lastRefresh.get(a.id) || 0) < 10 * 60e3) continue; // at most every 10 min per connection
+      lastRefresh.set(a.id, Date.now());
+      try { await snap.connections.refreshBrokerageAuthorization({ ...creds(user), authorizationId: a.id }); console.log('refresh requested for', a.brokerage?.name || a.id, 'status', a.status || ''); }
+      catch (e) { console.log('refresh failed', a.id, e.response?.status, e.message); }
+    }
+  } catch (e) { console.log('list authorizations failed', e.response?.status, e.message); }
+}
 async function accountPositions(user, accountId) {
   return tryChain([
-    async () => { const r = await snap.accountInformation.getUserHoldings({ ...creds(user), accountId }); return (r.data?.positions || []); },
+    async () => { const r = await snap.accountInformation.getUserHoldings({ ...creds(user), accountId });
+      console.log('holdings keys:', Object.keys(r.data || {}).join(','), '| positions:', (r.data?.positions || []).length, '| option_positions:', (r.data?.option_positions || []).length, '| balances:', JSON.stringify(r.data?.balances || []).slice(0, 200), '| total:', JSON.stringify(r.data?.total_value || null));
+      return (r.data?.positions || []); },
     async () => { const r = await snap.accountInformation.getUserAccountPositions({ ...creds(user), accountId }); return r.data || []; },
   ]);
 }
 async function listPositions(user) {
   const accts = (await snap.accountInformation.listUserAccounts(creds(user))).data || [];
+  console.log('accounts:', JSON.stringify(accts.map(a => ({ id: a.id, name: a.name, inst: a.institution_name, number: a.number ? '…' + String(a.number).slice(-4) : null, type: a.meta?.type || a.raw_type || null, sync: a.sync_status || null }))).slice(0, 600));
   const out = [];
   for (const a of accts) {
     let pos = [];
@@ -103,6 +118,7 @@ async function listPositions(user) {
       out.push({ symbol: String(sym).toUpperCase(), qty: p.units, avgCost: p.average_purchase_price ?? null, brokerPrice: p.price ?? null, account: a.name || a.institution_name || '' });
     }
   }
+  if (!out.length) await refreshConnections(user); // empty holdings right after connecting usually means the broker sync hasn't run yet
   const merged = new Map();
   for (const p of out) { const m = merged.get(p.symbol); if (!m) merged.set(p.symbol, { ...p }); else { const q = m.qty + p.qty; m.avgCost = m.avgCost != null && p.avgCost != null ? (m.avgCost * m.qty + p.avgCost * p.qty) / q : m.avgCost ?? p.avgCost; m.qty = q; } }
   return { accounts: accts.map(a => ({ id: a.id, name: a.name || '', institution: a.institution_name || '' })), positions: [...merged.values()] };
