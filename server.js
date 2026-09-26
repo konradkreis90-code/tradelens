@@ -20,6 +20,7 @@ const SNAP_CLIENT_ID = process.env.SNAPTRADE_CLIENT_ID, SNAP_CONSUMER_KEY = proc
 const DATABASE_URL = process.env.DATABASE_URL;
 // Shared secret the app must send (header x-peekline-key). Set APP_SECRET in Railway; leave unset while developing.
 const APP_SECRET = process.env.APP_SECRET || null;
+const DAILY_IMAGE_LIMIT = Number(process.env.DAILY_IMAGE_LIMIT || 25); // fair-use cap on chart-image analyses per device per day
 // Universe for "Top stocks of the day": the most-traded US names. Refreshed every 5 min within Finnhub's rate limit.
 const MOVERS_UNIVERSE = ['NVDA','TSLA','AAPL','AMD','PLTR','META','AMZN','MSFT','GOOGL','COIN','NBIS','SOFI','HOOD','MSTR','AVGO','NFLX','INTC','SMCI','MU','ARM','UBER','SHOP','CRWD','PANW','SNOW','RIVN','LCID','NIO','BABA','JPM','BAC','XOM','CVX','WMT','COST','DIS','BA','PFE','MRNA','LLY','UNH','V','MA','PYPL','SQ','SPY','QQQ','IWM','GLD','TLT'];
 
@@ -35,7 +36,21 @@ async function initDb() {
     snap_user_id TEXT, snap_user_secret TEXT, broker_name TEXT,
     created_at TIMESTAMPTZ DEFAULT now(), connected_at TIMESTAMPTZ
   )`);
+  await db.query(`CREATE TABLE IF NOT EXISTS usage (
+    device_id TEXT NOT NULL, day DATE NOT NULL, image_count INT NOT NULL DEFAULT 0, text_count INT NOT NULL DEFAULT 0,
+    PRIMARY KEY (device_id, day)
+  )`);
   console.log('db ready');
+}
+async function getUsage(deviceId) {
+  const r = await db.query(`SELECT image_count, text_count FROM usage WHERE device_id=$1 AND day=(now() AT TIME ZONE 'America/New_York')::date`, [deviceId]);
+  const row = r.rows[0] || { image_count: 0, text_count: 0 };
+  return { imageCount: row.image_count, textCount: row.text_count, limit: DAILY_IMAGE_LIMIT, remaining: Math.max(0, DAILY_IMAGE_LIMIT - row.image_count) };
+}
+async function bumpUsage(deviceId, withImage) {
+  const col = withImage ? 'image_count' : 'text_count';
+  await db.query(`INSERT INTO usage(device_id, day, ${col}) VALUES($1, (now() AT TIME ZONE 'America/New_York')::date, 1)
+    ON CONFLICT (device_id, day) DO UPDATE SET ${col} = usage.${col} + 1`, [deviceId]);
 }
 const isDeviceId = v => typeof v === 'string' && /^[a-zA-Z0-9\-]{16,64}$/.test(v);
 async function getUser(deviceId) {
@@ -327,6 +342,11 @@ const server = http.createServer(async (req, res) => {
   const appOnly = url.pathname.startsWith('/brokerage/') || url.pathname === '/me' || url.pathname === '/analyze' || url.pathname === '/movers';
   if (appOnly && APP_SECRET && req.headers['x-peekline-key'] !== APP_SECRET) return json(res, 401, { error: 'unauthorized' });
 
+  if (url.pathname === '/usage') {
+    const deviceId = url.searchParams.get('deviceId');
+    if (!db || !isDeviceId(deviceId)) return json(res, 400, { error: 'deviceId required' });
+    return json(res, 200, await getUsage(deviceId));
+  }
   if (url.pathname === '/movers') {
     return json(res, 200, { asOf: Date.now(), universe: MOVERS_UNIVERSE.length, movers: moversList() });
   }
@@ -380,8 +400,15 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse(await readBody(req));
       const ticker = String(body.ticker || '').toUpperCase().trim(); const price = Number(body.price);
       if (!/^[A-Z0-9.\-]{1,12}$/.test(ticker) || !(price > 0)) { res.writeHead(400, {'Content-Type':'application/json'}); return res.end('{"error":"ticker and price required"}'); }
+      const withImage = !!body.imageBase64; const deviceId = isDeviceId(body.deviceId) ? body.deviceId : null;
+      let usage = null;
+      if (db && deviceId) {
+        usage = await getUsage(deviceId);
+        if (withImage && usage.remaining <= 0) return json(res, 429, { error: 'daily limit', detail: `You've reached today's fair-use limit of ${DAILY_IMAGE_LIMIT} chart analyses. It resets at midnight Eastern.`, usage });
+      }
       const out = await analyzeChart({ ticker, price, changePct: body.changePct, horizon: body.horizon, imageBase64: body.imageBase64, mediaType: body.mediaType });
-      res.writeHead(200, {'Content-Type':'application/json'}); return res.end(JSON.stringify(out));
+      if (db && deviceId) { await bumpUsage(deviceId, withImage); usage = await getUsage(deviceId); }
+      res.writeHead(200, {'Content-Type':'application/json'}); return res.end(JSON.stringify({ ...out, usage }));
     } catch (e) {
       console.error('analyze failed', e.message);
       res.writeHead(502, {'Content-Type':'application/json'}); return res.end(JSON.stringify({ error: 'analysis failed', detail: String(e.message).slice(0, 200) }));
