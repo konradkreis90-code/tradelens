@@ -74,20 +74,35 @@ async function ensureSnapUser(user) {
 }
 const creds = u => ({ userId: u.snap_user_id, userSecret: u.snap_user_secret });
 
+// Try the current endpoint first, fall back to older ones if SnapTrade returns 410/404.
+async function tryChain(steps) {
+  let lastErr;
+  for (const step of steps) {
+    try { return await step(); }
+    catch (e) { lastErr = e; const code = e.response?.status; if (code && ![404, 410].includes(code)) throw e; console.log('endpoint unavailable, trying next:', code, e.message); }
+  }
+  throw lastErr;
+}
+async function accountPositions(user, accountId) {
+  return tryChain([
+    async () => { const r = await snap.accountInformation.getUserHoldings({ ...creds(user), accountId }); return (r.data?.positions || []); },
+    async () => { const r = await snap.accountInformation.getUserAccountPositions({ ...creds(user), accountId }); return r.data || []; },
+  ]);
+}
 async function listPositions(user) {
   const accts = (await snap.accountInformation.listUserAccounts(creds(user))).data || [];
   const out = [];
   for (const a of accts) {
     let pos = [];
-    try { pos = (await snap.accountInformation.getUserAccountPositions({ ...creds(user), accountId: a.id })).data || []; } catch (e) { console.error('positions', a.id, e.message); }
+    try { pos = await accountPositions(user, a.id); } catch (e) { console.error('positions', a.id, e.response?.status, e.message); }
     console.log(`positions: account ${a.id} (${a.institution_name || a.name}) returned ${pos.length} raw`);
+    if (pos.length) console.log('positions sample:', JSON.stringify(pos[0]).slice(0, 400));
     for (const p of pos) {
-      const sym = p.symbol?.symbol?.symbol || p.symbol?.symbol?.raw_symbol || p.symbol?.raw_symbol || p.symbol?.symbol || null;
+      const sym = p.symbol?.symbol?.symbol || p.symbol?.symbol?.raw_symbol || p.symbol?.raw_symbol || p.symbol?.symbol || p.symbol?.ticker || null;
       if (!sym || !(p.units > 0)) continue;
       out.push({ symbol: String(sym).toUpperCase(), qty: p.units, avgCost: p.average_purchase_price ?? null, brokerPrice: p.price ?? null, account: a.name || a.institution_name || '' });
     }
   }
-  // merge same symbol across accounts
   const merged = new Map();
   for (const p of out) { const m = merged.get(p.symbol); if (!m) merged.set(p.symbol, { ...p }); else { const q = m.qty + p.qty; m.avgCost = m.avgCost != null && p.avgCost != null ? (m.avgCost * m.qty + p.avgCost * p.qty) / q : m.avgCost ?? p.avgCost; m.qty = q; } }
   return { accounts: accts.map(a => ({ id: a.id, name: a.name || '', institution: a.institution_name || '' })), positions: [...merged.values()] };
@@ -100,13 +115,13 @@ async function listTrades(user, days = 180) {
   let acts = [];
   for (const a of accts) {
     // Per-account activities (the older all-accounts endpoint returns 410 Gone).
-    let cursor = undefined, guard = 0;
-    do {
-      const r = await snap.accountInformation.getAccountActivities({ ...creds(user), accountId: a.id, startDate: fmt(start), endDate: fmt(end), limit: 1000, ...(cursor ? { offset: cursor } : {}) });
-      const page = r.data?.data || r.data?.activities || (Array.isArray(r.data) ? r.data : []);
+    try {
+      const page = await tryChain([
+        async () => { const r = await snap.accountInformation.getAccountActivities({ ...creds(user), accountId: a.id, startDate: fmt(start), endDate: fmt(end), limit: 1000 }); return r.data?.data || r.data?.activities || (Array.isArray(r.data) ? r.data : []); },
+        async () => { const r = await snap.transactionsAndReporting.getActivities({ ...creds(user), accounts: a.id, startDate: fmt(start), endDate: fmt(end) }); return r.data || []; },
+      ]);
       acts = acts.concat(page);
-      const pg = r.data?.pagination; cursor = pg && pg.offset != null && page.length && pg.offset + page.length < (pg.total || 0) ? pg.offset + page.length : undefined;
-    } while (cursor && ++guard < 20);
+    } catch (e) { console.error('activities', a.id, e.response?.status, e.message); }
   }
   console.log(`activities: ${acts.length} raw across ${accts.length} account(s); types: ${[...new Set(acts.map(a => a.type))].join(',') || 'none'}`);
   const fills = acts.filter(a => ['BUY', 'SELL'].includes(String(a.type || '').toUpperCase()) && a.units && a.price)
