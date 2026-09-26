@@ -140,7 +140,7 @@ async function listPositions(user) {
   return { accounts: accts.map(a => ({ id: a.id, name: a.name || '', institution: a.institution_name || '' })), positions: [...merged.values()] };
 }
 
-async function listTrades(user, days = 180) {
+async function listTrades(user, days = 730) {
   const end = new Date(), start = new Date(Date.now() - days * 86400000);
   const fmt = d => d.toISOString().slice(0, 10);
   const accts = (await snap.accountInformation.listUserAccounts(creds(user))).data || [];
@@ -170,14 +170,17 @@ async function listTrades(user, days = 180) {
       closed.push({ symbol: f.symbol, side: 'Long', qty: take, entry: lot.price, exit: f.price, entryDate: lot.date, exitDate: f.date, plPct: (f.price - lot.price) / lot.price * 100 });
       lot.qty -= take; left -= take; if (lot.qty <= 0) q.shift();
     }
+    // Sold shares with no visible buy: bought before the history window (or transferred in). Keep the sale visible.
+    if (left > 0) closed.push({ symbol: f.symbol, side: 'Long', qty: left, entry: null, exit: f.price, entryDate: null, exitDate: f.date, plPct: null, note: 'Bought before available history' });
   }
+  console.log(`trades: ${fills.length} fills -> ${closed.length} closed (${closed.filter(c => c.entry == null).length} without a visible buy)`);
   return { fills, closed: closed.sort((a, b) => a.exitDate < b.exitDate ? 1 : -1).slice(0, 30) };
 }
 
 async function gradeTrades(closed) {
   if (!ANTHROPIC_API_KEY || !closed.length) return closed.map(t => ({ ...t, grade: null, why: '' }));
   const system = `You grade a retail trader's closed stock trades for education. For each trade give a letter grade A, B or C and a 1-2 sentence "why" in plain English that a beginner understands. Judge: was the entry at a sensible level relative to the move, was risk defined and proportionate, was the exit disciplined (took profit / cut loss) or emotional. You only know entry, exit, dates and size, so be fair about uncertainty and never invent chart details. Return ONLY JSON: {"grades":[{"i":index,"grade":"A|B|C","why":"..."}]}`;
-  const list = closed.map((t, i) => `${i}: ${t.symbol} ${t.side} ${t.qty} sh, in ${t.entry} on ${t.entryDate}, out ${t.exit} on ${t.exitDate}, P/L ${t.plPct.toFixed(1)}%`).join('\n');
+  const list = closed.map((t, i) => t.entry == null ? `${i}: ${t.symbol} SELL ${t.qty} sh at ${t.exit} on ${t.exitDate} (entry unknown: bought before history window) - grade null` : `${i}: ${t.symbol} ${t.side} ${t.qty} sh, in ${t.entry} on ${t.entryDate}, out ${t.exit} on ${t.exitDate}, P/L ${t.plPct.toFixed(1)}%`).join('\n');
   const res = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
     body: JSON.stringify({ model: ANTHROPIC_MODEL, max_tokens: 2000, system, messages: [{ role: 'user', content: list }] }) });
   if (!res.ok) throw new Error('grade model ' + res.status);
