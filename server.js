@@ -135,7 +135,8 @@ async function listPositions(user) {
       const sym = p.instrument?.symbol || p.instrument?.ticker || p.symbol?.symbol?.symbol || p.symbol?.symbol?.raw_symbol || p.symbol?.raw_symbol || (typeof p.symbol === 'string' ? p.symbol : p.symbol?.symbol) || p.symbol?.ticker || p.ticker || null;
       const qty = Number(p.units ?? p.quantity ?? p.fractional_units ?? 0);
       if (!sym || !(qty > 0)) { console.log('skipped position', JSON.stringify(p).slice(0, 200)); continue; }
-      out.push({ symbol: String(sym).toUpperCase(), qty, avgCost: p.average_purchase_price ?? p.average_cost ?? p.cost_basis_per_unit ?? null, brokerPrice: p.price ?? p.last_price ?? null, account: a.name || a.institution_name || '' });
+      const n = v => (v == null || v === '' ? null : (isFinite(Number(v)) ? Number(v) : null));
+      out.push({ symbol: String(sym).toUpperCase(), qty, avgCost: n(p.average_purchase_price ?? p.average_cost ?? p.cost_basis_per_unit), brokerPrice: n(p.price ?? p.last_price), account: a.name || a.institution_name || '' });
     }
   }
   if (!out.length) await refreshConnections(user); // empty holdings right after connecting usually means the broker sync hasn't run yet
@@ -161,8 +162,8 @@ async function listTrades(user, days = 730) {
   }
   console.log(`activities: ${acts.length} raw across ${accts.length} account(s); types: ${[...new Set(acts.map(a => a.type))].join(',') || 'none'}`, acts.length ? '| sample: ' + JSON.stringify(acts[0]).slice(0, 400) : '');
   const fills = acts.filter(a => ['BUY', 'SELL'].includes(String(a.type || '').toUpperCase()) && a.units && a.price)
-    .map(a => ({ symbol: String(a.instrument?.symbol || a.symbol?.symbol || a.symbol?.raw_symbol || (typeof a.symbol === 'string' ? a.symbol : '') || a.option_symbol?.ticker || '').toUpperCase(), side: String(a.type).toUpperCase(), qty: Math.abs(a.units), price: a.price, date: (a.trade_date || a.settlement_date || '').slice(0, 10) }))
-    .filter(f => f.symbol).sort((x, y) => x.date < y.date ? -1 : 1);
+    .map(a => ({ symbol: String(a.instrument?.symbol || a.symbol?.symbol || a.symbol?.raw_symbol || (typeof a.symbol === 'string' ? a.symbol : '') || a.option_symbol?.ticker || '').toUpperCase(), side: String(a.type).toUpperCase(), qty: Math.abs(Number(a.units)), price: Number(a.price), date: (a.trade_date || a.settlement_date || '').slice(0, 10) }))
+    .filter(f => f.symbol && f.qty > 0 && f.price > 0).sort((x, y) => x.date < y.date ? -1 : 1);
   // FIFO pairing into closed trades
   const open = new Map(), closed = [];
   for (const f of fills) {
