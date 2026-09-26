@@ -80,6 +80,7 @@ async function listPositions(user) {
   for (const a of accts) {
     let pos = [];
     try { pos = (await snap.accountInformation.getUserAccountPositions({ ...creds(user), accountId: a.id })).data || []; } catch (e) { console.error('positions', a.id, e.message); }
+    console.log(`positions: account ${a.id} (${a.institution_name || a.name}) returned ${pos.length} raw`);
     for (const p of pos) {
       const sym = p.symbol?.symbol?.symbol || p.symbol?.symbol?.raw_symbol || p.symbol?.raw_symbol || p.symbol?.symbol || null;
       if (!sym || !(p.units > 0)) continue;
@@ -95,14 +96,26 @@ async function listPositions(user) {
 async function listTrades(user, days = 180) {
   const end = new Date(), start = new Date(Date.now() - days * 86400000);
   const fmt = d => d.toISOString().slice(0, 10);
-  const acts = (await snap.transactionsAndReporting.getActivities({ ...creds(user), startDate: fmt(start), endDate: fmt(end) })).data || [];
+  const accts = (await snap.accountInformation.listUserAccounts(creds(user))).data || [];
+  let acts = [];
+  for (const a of accts) {
+    // Per-account activities (the older all-accounts endpoint returns 410 Gone).
+    let cursor = undefined, guard = 0;
+    do {
+      const r = await snap.accountInformation.getAccountActivities({ ...creds(user), accountId: a.id, startDate: fmt(start), endDate: fmt(end), limit: 1000, ...(cursor ? { offset: cursor } : {}) });
+      const page = r.data?.data || r.data?.activities || (Array.isArray(r.data) ? r.data : []);
+      acts = acts.concat(page);
+      const pg = r.data?.pagination; cursor = pg && pg.offset != null && page.length && pg.offset + page.length < (pg.total || 0) ? pg.offset + page.length : undefined;
+    } while (cursor && ++guard < 20);
+  }
+  console.log(`activities: ${acts.length} raw across ${accts.length} account(s); types: ${[...new Set(acts.map(a => a.type))].join(',') || 'none'}`);
   const fills = acts.filter(a => ['BUY', 'SELL'].includes(String(a.type || '').toUpperCase()) && a.units && a.price)
-    .map(a => ({ symbol: String(a.symbol?.symbol || a.symbol?.raw_symbol || '').toUpperCase(), side: String(a.type).toUpperCase(), qty: Math.abs(a.units), price: a.price, date: (a.trade_date || a.settlement_date || '').slice(0, 10) }))
+    .map(a => ({ symbol: String(a.symbol?.symbol || a.symbol?.raw_symbol || a.option_symbol?.ticker || '').toUpperCase(), side: String(a.type).toUpperCase(), qty: Math.abs(a.units), price: a.price, date: (a.trade_date || a.settlement_date || '').slice(0, 10) }))
     .filter(f => f.symbol).sort((x, y) => x.date < y.date ? -1 : 1);
   // FIFO pairing into closed trades
   const open = new Map(), closed = [];
   for (const f of fills) {
-    const q = open.get(f.symbol) || []; 
+    const q = open.get(f.symbol) || [];
     if (f.side === 'BUY') { q.push({ ...f }); open.set(f.symbol, q); continue; }
     let left = f.qty;
     while (left > 0 && q.length) {
