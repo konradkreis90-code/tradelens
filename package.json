@@ -13,6 +13,6 @@
   "dependencies": {
     "ws": "^8.18.0",
     "pg": "^8.13.0",
-    "snaptrade-typescript-sdk": "^9.0.0"
+    "snaptrade-typescript-sdk": "latest"
   }
 }

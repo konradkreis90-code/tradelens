@@ -96,10 +96,14 @@ async function refreshConnections(user) {
   } catch (e) { console.log('list authorizations failed', e.response?.status, e.message); }
 }
 async function accountPositions(user, accountId) {
+  // Current SnapTrade API (accounts created after May 2026 only have these):
+  //   GET /accounts/{id}/positions/all  -> { positions:[stocks], option_positions:[...] }
+  //   GET /accounts/{id}/positions      -> [stocks]
+  // The old /holdings endpoints return 410 Gone for new customers.
   return tryChain([
-    async () => { const r = await snap.accountInformation.getUserHoldings({ ...creds(user), accountId });
-      console.log('holdings keys:', Object.keys(r.data || {}).join(','), '| positions:', (r.data?.positions || []).length, '| option_positions:', (r.data?.option_positions || []).length, '| balances:', JSON.stringify(r.data?.balances || []).slice(0, 200), '| total:', JSON.stringify(r.data?.total_value || null));
-      return (r.data?.positions || []); },
+    async () => { const r = await snap.accountInformation.getAllAccountPositions({ ...creds(user), accountId });
+      const d = r.data || {}; console.log('positions/all keys:', Object.keys(d).join(','), '| stocks:', (d.positions || []).length, '| options:', (d.option_positions || []).length);
+      return Array.isArray(d) ? d : (d.positions || []); },
     async () => { const r = await snap.accountInformation.getUserAccountPositions({ ...creds(user), accountId }); return r.data || []; },
   ]);
 }
