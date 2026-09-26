@@ -264,7 +264,7 @@ function readBody(req, limit = 12 * 1024 * 1024) {
 }
 const num = (v, fallback) => (typeof v === 'number' && isFinite(v) ? v : fallback);
 
-async function analyzeChart({ ticker, price, changePct, horizon, imageBase64, mediaType }) {
+async function analyzeChart({ ticker, price, changePct, horizon, imageBase64, mediaType, strategy }) {
   const tf = { Intraday: '15m', Swing: '4H', Position: '1D', 'Long term': '1W' }[horizon] || '1D';
   const system = `You are a disciplined technical analyst. You read price charts and describe structure, levels and a potential trade plan for education, never as advice.
 Return ONLY a JSON object, no prose, no markdown fences, with exactly these keys:
@@ -279,11 +279,13 @@ Return ONLY a JSON object, no prose, no markdown fences, with exactly these keys
  "signals": [ {"t": string, "d": "up"|"dn"|""} ] (4 to 6 short items: RSI, MACD, volume, moving averages, pattern),
  "explanation": string (3-5 sentences, plain English, reference the actual levels you chose),
  "bullCase": string (1-2 sentences), "bearCase": string (1-2 sentences),
+ "fit": { "score": "Strong" | "Partial" | "Poor" | null, "why": string } (how well THIS chart fits the trader's stated strategy; null score if no strategy given),
  "series": number[] (about 40 numbers: the approximate price path visible on the chart from left to right, ending near the current price; if no chart image, return [])
 }
 ${tf === '15m' || tf === '5m' || tf === '1m' ? `INTRADAY MODE (day trader): the trader wants precise, actionable numbers. Give every level to the cent. Use the chart's own structure: opening range high/low, prior-day high/low/close, VWAP or moving averages if drawn, obvious intraday swing points, round numbers. Keep the stop tight (typically 0.3%-1.5% from entry) and place it just beyond a real level, not an arbitrary distance. target must be the nearest realistic objective; target2 the next level beyond it. The trigger must be a concrete, observable condition (a break, a reclaim, a rejection at a level) with a price. If the chart does not show enough intraday detail to be precise, say so in the explanation and widen the entry instead of guessing.` : `SWING MODE: levels can be rounded sensibly; target2 may be null.`}
 Rules: all price levels must be plausible relative to the CURRENT PRICE given (typically within 40% of it). Support must be below current price and resistance above, unless the chart clearly shows otherwise. For a long setup: entryLo <= entryHi <= about current price, target > entryHi, stop < entryLo. For a short setup: reverse. If the image is not a price chart, set trend to "Neutral", pattern to "Not a chart", and explain that in one sentence.`;
-  const userText = `Ticker: ${ticker}\nCURRENT PRICE (live): ${price}${typeof changePct === 'number' ? `\nChange today: ${changePct.toFixed(2)}%` : ''}\nTrader's preferred timeframe: ${tf}${imageBase64 ? '\nA chart image is attached. Read the actual levels from it.' : '\nNo chart image was provided; analyze from ticker and price context only and say so.'}`;
+  const stratText = strategy ? `\nTRADER'S STRATEGY: ${strategy.name}. Style: ${strategy.style}. Entry trigger: ${strategy.trigger}. Stop placement: ${strategy.stop}. Targets: ${strategy.target}.${strategy.notes ? ' Notes: ' + strategy.notes : ''}\nJudge the chart against THIS strategy: say plainly whether it fits (Strong/Partial/Poor) and why in one or two sentences, and shape trigger, stop and targets to match the strategy's rules. If the chart does not fit, still give the levels the strategy would need to see before entering.` : '';
+  const userText = `Ticker: ${ticker}\nCURRENT PRICE (live): ${price}${typeof changePct === 'number' ? `\nChange today: ${changePct.toFixed(2)}%` : ''}\nTrader's preferred timeframe: ${tf}${stratText}${imageBase64 ? '\nA chart image is attached. Read the actual levels from it.' : '\nNo chart image was provided; analyze from ticker and price context only and say so.'}`;
   const content = [];
   if (imageBase64) {
     // Detect the real format from the bytes; phones often mislabel JPEGs as PNGs.
@@ -326,6 +328,7 @@ Rules: all price levels must be plausible relative to the CURRENT PRICE given (t
     signals: (Array.isArray(j.signals) ? j.signals : []).slice(0, 6).map(x => ({ t: String(x.t || ''), d: ['up', 'dn'].includes(x.d) ? x.d : '' })).filter(x => x.t),
     pattern: String(j.pattern || 'No clear pattern'), bull: trend !== 'Bearish',
     explanation: String(j.explanation || ''), bullCase: String(j.bullCase || ''), bearCase: String(j.bearCase || ''),
+    fit: strategy && j.fit && ['Strong','Partial','Poor'].includes(j.fit.score) ? { score: j.fit.score, why: String(j.fit.why || ''), strategy: strategy.name } : null,
     at: Date.now(), priceSource: 'live', engine: ANTHROPIC_MODEL, hadImage: !!imageBase64
   };
 }
@@ -406,7 +409,8 @@ const server = http.createServer(async (req, res) => {
         usage = await getUsage(deviceId);
         if (withImage && usage.remaining <= 0) return json(res, 429, { error: 'daily limit', detail: `You've reached today's fair-use limit of ${DAILY_IMAGE_LIMIT} chart analyses. It resets at midnight Eastern.`, usage });
       }
-      const out = await analyzeChart({ ticker, price, changePct: body.changePct, horizon: body.horizon, imageBase64: body.imageBase64, mediaType: body.mediaType });
+      const st = body.strategy && typeof body.strategy === 'object' ? { name: String(body.strategy.name || '').slice(0, 60), style: String(body.strategy.style || '').slice(0, 40), trigger: String(body.strategy.trigger || '').slice(0, 120), stop: String(body.strategy.stop || '').slice(0, 120), target: String(body.strategy.target || '').slice(0, 120), notes: String(body.strategy.notes || '').slice(0, 300) } : null;
+      const out = await analyzeChart({ ticker, price, changePct: body.changePct, horizon: body.horizon, imageBase64: body.imageBase64, mediaType: body.mediaType, strategy: st && st.name ? st : null });
       if (db && deviceId) { await bumpUsage(deviceId, withImage); usage = await getUsage(deviceId); }
       res.writeHead(200, {'Content-Type':'application/json'}); return res.end(JSON.stringify({ ...out, usage }));
     } catch (e) {
