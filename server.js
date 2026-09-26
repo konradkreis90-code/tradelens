@@ -61,8 +61,17 @@ async function getUser(deviceId) {
 // ---------------------------------------------------------------------------
 // SnapTrade (read-only brokerage connections)
 // ---------------------------------------------------------------------------
-const { Snaptrade } = require('snaptrade-typescript-sdk');
-const snap = SNAP_CLIENT_ID && SNAP_CONSUMER_KEY ? new Snaptrade({ clientId: SNAP_CLIENT_ID, consumerKey: SNAP_CONSUMER_KEY }) : null;
+const snapSdk = require('snaptrade-typescript-sdk');
+function makeSnap() {
+  if (!SNAP_CLIENT_ID || !SNAP_CONSUMER_KEY) return null;
+  // SDK v10+ uses an auth object; older versions take the keys directly.
+  if (snapSdk.SnaptradeAuth && typeof snapSdk.SnaptradeAuth.commercialApiKey === 'function') {
+    return new snapSdk.Snaptrade({ auth: snapSdk.SnaptradeAuth.commercialApiKey({ clientId: SNAP_CLIENT_ID, consumerKey: SNAP_CONSUMER_KEY }) });
+  }
+  return new snapSdk.Snaptrade({ clientId: SNAP_CLIENT_ID, consumerKey: SNAP_CONSUMER_KEY });
+}
+const snap = makeSnap();
+if (snap) console.log('snaptrade sdk ready', snapSdk.SnaptradeAuth ? '(auth-object mode)' : '(legacy mode)');
 
 async function ensureSnapUser(user) {
   if (user.snap_user_id && user.snap_user_secret) return user;
