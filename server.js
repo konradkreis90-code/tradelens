@@ -114,8 +114,9 @@ async function accountPositions(user, accountId) {
   // The old /holdings endpoints return 410 Gone for new customers.
   return tryChain([
     async () => { const r = await snap.accountInformation.getAllAccountPositions({ ...creds(user), accountId });
-      const d = r.data || {}; console.log('positions/all keys:', Object.keys(d).join(','), '| stocks:', (d.positions || []).length, '| options:', (d.option_positions || []).length);
-      return Array.isArray(d) ? d : (d.positions || []); },
+      const d = r.data || {}; const list = Array.isArray(d) ? d : (d.results || d.positions || []);
+      console.log('positions/all keys:', Object.keys(d).join(','), '| entries:', list.length, list.length ? '| sample: ' + JSON.stringify(list[0]).slice(0, 500) : '');
+      return list; },
     async () => { const r = await snap.accountInformation.getUserAccountPositions({ ...creds(user), accountId }); return r.data || []; },
   ]);
 }
@@ -129,9 +130,12 @@ async function listPositions(user) {
     console.log(`positions: account ${a.id} (${a.institution_name || a.name}) returned ${pos.length} raw`);
     if (pos.length) console.log('positions sample:', JSON.stringify(pos[0]).slice(0, 400));
     for (const p of pos) {
-      const sym = p.symbol?.symbol?.symbol || p.symbol?.symbol?.raw_symbol || p.symbol?.raw_symbol || p.symbol?.symbol || p.symbol?.ticker || null;
-      if (!sym || !(p.units > 0)) continue;
-      out.push({ symbol: String(sym).toUpperCase(), qty: p.units, avgCost: p.average_purchase_price ?? null, brokerPrice: p.price ?? null, account: a.name || a.institution_name || '' });
+      const kind = String(p.type || p.instrument?.type || p.symbol?.type?.code || '').toUpperCase();
+      if (kind.includes('OPTION')) continue; // options come later
+      const sym = p.instrument?.symbol || p.instrument?.ticker || p.symbol?.symbol?.symbol || p.symbol?.symbol?.raw_symbol || p.symbol?.raw_symbol || (typeof p.symbol === 'string' ? p.symbol : p.symbol?.symbol) || p.symbol?.ticker || p.ticker || null;
+      const qty = Number(p.units ?? p.quantity ?? p.fractional_units ?? 0);
+      if (!sym || !(qty > 0)) { console.log('skipped position', JSON.stringify(p).slice(0, 200)); continue; }
+      out.push({ symbol: String(sym).toUpperCase(), qty, avgCost: p.average_purchase_price ?? p.average_cost ?? p.cost_basis_per_unit ?? null, brokerPrice: p.price ?? p.last_price ?? null, account: a.name || a.institution_name || '' });
     }
   }
   if (!out.length) await refreshConnections(user); // empty holdings right after connecting usually means the broker sync hasn't run yet
@@ -149,15 +153,15 @@ async function listTrades(user, days = 730) {
     // Per-account activities (the older all-accounts endpoint returns 410 Gone).
     try {
       const page = await tryChain([
-        async () => { const r = await snap.accountInformation.getAccountActivities({ ...creds(user), accountId: a.id, startDate: fmt(start), endDate: fmt(end), limit: 1000 }); return r.data?.data || r.data?.activities || (Array.isArray(r.data) ? r.data : []); },
+        async () => { const r = await snap.accountInformation.getAccountActivities({ ...creds(user), accountId: a.id, startDate: fmt(start), endDate: fmt(end), limit: 1000 }); return r.data?.data || r.data?.results || r.data?.activities || (Array.isArray(r.data) ? r.data : []); },
         async () => { const r = await snap.transactionsAndReporting.getActivities({ ...creds(user), accounts: a.id, startDate: fmt(start), endDate: fmt(end) }); return r.data || []; },
       ]);
       acts = acts.concat(page);
     } catch (e) { console.error('activities', a.id, e.response?.status, e.message); }
   }
-  console.log(`activities: ${acts.length} raw across ${accts.length} account(s); types: ${[...new Set(acts.map(a => a.type))].join(',') || 'none'}`);
+  console.log(`activities: ${acts.length} raw across ${accts.length} account(s); types: ${[...new Set(acts.map(a => a.type))].join(',') || 'none'}`, acts.length ? '| sample: ' + JSON.stringify(acts[0]).slice(0, 400) : '');
   const fills = acts.filter(a => ['BUY', 'SELL'].includes(String(a.type || '').toUpperCase()) && a.units && a.price)
-    .map(a => ({ symbol: String(a.symbol?.symbol || a.symbol?.raw_symbol || a.option_symbol?.ticker || '').toUpperCase(), side: String(a.type).toUpperCase(), qty: Math.abs(a.units), price: a.price, date: (a.trade_date || a.settlement_date || '').slice(0, 10) }))
+    .map(a => ({ symbol: String(a.instrument?.symbol || a.symbol?.symbol || a.symbol?.raw_symbol || (typeof a.symbol === 'string' ? a.symbol : '') || a.option_symbol?.ticker || '').toUpperCase(), side: String(a.type).toUpperCase(), qty: Math.abs(a.units), price: a.price, date: (a.trade_date || a.settlement_date || '').slice(0, 10) }))
     .filter(f => f.symbol).sort((x, y) => x.date < y.date ? -1 : 1);
   // FIFO pairing into closed trades
   const open = new Map(), closed = [];
@@ -182,10 +186,11 @@ async function gradeTrades(closed) {
   const system = `You grade a retail trader's closed stock trades for education. For each trade give a letter grade A, B or C and a 1-2 sentence "why" in plain English that a beginner understands. Judge: was the entry at a sensible level relative to the move, was risk defined and proportionate, was the exit disciplined (took profit / cut loss) or emotional. You only know entry, exit, dates and size, so be fair about uncertainty and never invent chart details. Return ONLY JSON: {"grades":[{"i":index,"grade":"A|B|C","why":"..."}]}`;
   const list = closed.map((t, i) => t.entry == null ? `${i}: ${t.symbol} SELL ${t.qty} sh at ${t.exit} on ${t.exitDate} (entry unknown: bought before history window) - grade null` : `${i}: ${t.symbol} ${t.side} ${t.qty} sh, in ${t.entry} on ${t.entryDate}, out ${t.exit} on ${t.exitDate}, P/L ${t.plPct.toFixed(1)}%`).join('\n');
   const res = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: ANTHROPIC_MODEL, max_tokens: 2000, system, messages: [{ role: 'user', content: list }] }) });
-  if (!res.ok) throw new Error('grade model ' + res.status);
+    body: JSON.stringify({ model: ANTHROPIC_MODEL, max_tokens: 6000, system, messages: [{ role: 'user', content: list }] }) });
+  if (!res.ok) { console.error('grade model', res.status); return closed.map(t => ({ ...t, grade: null, why: '' })); }
   const data = await res.json(); const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
-  const j = JSON.parse(text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1));
+  let j; try { j = JSON.parse(text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1)); }
+  catch (e) { console.error('grade parse failed:', e.message, '| stop_reason:', data.stop_reason); return closed.map(t => ({ ...t, grade: null, why: '' })); }
   const by = new Map((j.grades || []).map(g => [g.i, g]));
   return closed.map((t, i) => ({ ...t, grade: ['A', 'B', 'C'].includes(by.get(i)?.grade) ? by.get(i).grade : null, why: String(by.get(i)?.why || '') }));
 }
