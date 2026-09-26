@@ -258,13 +258,15 @@ Return ONLY a JSON object, no prose, no markdown fences, with exactly these keys
  "trend": "Bullish" | "Bearish" | "Neutral",
  "support": number, "resistance": number,
  "rsi": number (0-100; estimate from the chart if an RSI pane is visible, else infer from momentum and say so in explanation),
- "entryLo": number, "entryHi": number, "target": number, "stop": number,
+ "entryLo": number, "entryHi": number, "target": number, "target2": number | null, "stop": number,
+ "trigger": string (one sentence: the exact condition and price that would start the trade, e.g. "Buy on a 5-minute close above $241.20 with volume above the morning average"),
  "pattern": string (e.g. "Bull flag", "Range consolidation", or "No clear pattern"),
  "signals": [ {"t": string, "d": "up"|"dn"|""} ] (4 to 6 short items: RSI, MACD, volume, moving averages, pattern),
  "explanation": string (3-5 sentences, plain English, reference the actual levels you chose),
  "bullCase": string (1-2 sentences), "bearCase": string (1-2 sentences),
  "series": number[] (about 40 numbers: the approximate price path visible on the chart from left to right, ending near the current price; if no chart image, return [])
 }
+${tf === '15m' || tf === '5m' || tf === '1m' ? `INTRADAY MODE (day trader): the trader wants precise, actionable numbers. Give every level to the cent. Use the chart's own structure: opening range high/low, prior-day high/low/close, VWAP or moving averages if drawn, obvious intraday swing points, round numbers. Keep the stop tight (typically 0.3%-1.5% from entry) and place it just beyond a real level, not an arbitrary distance. target must be the nearest realistic objective; target2 the next level beyond it. The trigger must be a concrete, observable condition (a break, a reclaim, a rejection at a level) with a price. If the chart does not show enough intraday detail to be precise, say so in the explanation and widen the entry instead of guessing.` : `SWING MODE: levels can be rounded sensibly; target2 may be null.`}
 Rules: all price levels must be plausible relative to the CURRENT PRICE given (typically within 40% of it). Support must be below current price and resistance above, unless the chart clearly shows otherwise. For a long setup: entryLo <= entryHi <= about current price, target > entryHi, stop < entryLo. For a short setup: reverse. If the image is not a price chart, set trend to "Neutral", pattern to "Not a chart", and explain that in one sentence.`;
   const userText = `Ticker: ${ticker}\nCURRENT PRICE (live): ${price}${typeof changePct === 'number' ? `\nChange today: ${changePct.toFixed(2)}%` : ''}\nTrader's preferred timeframe: ${tf}${imageBase64 ? '\nA chart image is attached. Read the actual levels from it.' : '\nNo chart image was provided; analyze from ticker and price context only and say so.'}`;
   const content = [];
@@ -296,6 +298,7 @@ Rules: all price levels must be plausible relative to the CURRENT PRICE given (t
   const support = inBand(j.support) ? j.support : price * 0.95, resistance = inBand(j.resistance) ? j.resistance : price * 1.05;
   const entryLo = inBand(j.entryLo) ? j.entryLo : price * 0.99, entryHi = inBand(j.entryHi) ? j.entryHi : price * 1.005;
   const target = inBand(j.target) ? j.target : resistance, stop = inBand(j.stop) ? j.stop : support * 0.985;
+  const target2 = inBand(j.target2) ? j.target2 : null;
   const mid = (entryLo + entryHi) / 2, rr = Math.abs(target - mid) / Math.max(Math.abs(mid - stop), price * 0.001);
   let series = Array.isArray(j.series) ? j.series.filter(v => typeof v === 'number' && isFinite(v) && v > 0).slice(0, 80) : [];
   if (series.length < 8) series = Array.from({ length: 40 }, (_, i) => support + (price - support) * (i / 39)); // flat-ish placeholder path
@@ -304,7 +307,7 @@ Rules: all price levels must be plausible relative to the CURRENT PRICE given (t
   return {
     ticker, price, timeframe: String(j.timeframe || tf), trend, support, resistance,
     rsi: Math.round(Math.max(0, Math.min(100, num(j.rsi, 50)))), pts: series,
-    entryLo, entryHi, target, stop, rr: Math.round(rr * 10) / 10,
+    entryLo, entryHi, target, target2, stop, rr: Math.round(rr * 10) / 10, trigger: String(j.trigger || ''), intraday: tf === '15m' || tf === '5m' || tf === '1m',
     signals: (Array.isArray(j.signals) ? j.signals : []).slice(0, 6).map(x => ({ t: String(x.t || ''), d: ['up', 'dn'].includes(x.d) ? x.d : '' })).filter(x => x.t),
     pattern: String(j.pattern || 'No clear pattern'), bull: trend !== 'Bearish',
     explanation: String(j.explanation || ''), bullCase: String(j.bullCase || ''), bearCase: String(j.bearCase || ''),
