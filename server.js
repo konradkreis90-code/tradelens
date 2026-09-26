@@ -18,6 +18,10 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY; // for /analyze (chart 
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-5';
 const SNAP_CLIENT_ID = process.env.SNAPTRADE_CLIENT_ID, SNAP_CONSUMER_KEY = process.env.SNAPTRADE_CONSUMER_KEY;
 const DATABASE_URL = process.env.DATABASE_URL;
+// Shared secret the app must send (header x-peekline-key). Set APP_SECRET in Railway; leave unset while developing.
+const APP_SECRET = process.env.APP_SECRET || null;
+// Universe for "Top stocks of the day": the most-traded US names. Refreshed every 5 min within Finnhub's rate limit.
+const MOVERS_UNIVERSE = ['NVDA','TSLA','AAPL','AMD','PLTR','META','AMZN','MSFT','GOOGL','COIN','NBIS','SOFI','HOOD','MSTR','AVGO','NFLX','INTC','SMCI','MU','ARM','UBER','SHOP','CRWD','PANW','SNOW','RIVN','LCID','NIO','BABA','JPM','BAC','XOM','CVX','WMT','COST','DIS','BA','PFE','MRNA','LLY','UNH','V','MA','PYPL','SQ','SPY','QQQ','IWM','GLD','TLT'];
 
 // ---------------------------------------------------------------------------
 // Database (Railway Postgres). One row per app install ("device account").
@@ -106,6 +110,36 @@ async function gradeTrades(closed) {
   const j = JSON.parse(text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1));
   const by = new Map((j.grades || []).map(g => [g.i, g]));
   return closed.map((t, i) => ({ ...t, grade: ['A', 'B', 'C'].includes(by.get(i)?.grade) ? by.get(i).grade : null, why: String(by.get(i)?.why || '') }));
+}
+
+let brokerListCache = { at: 0, data: [] };
+async function listBrokerages() {
+  if (Date.now() - brokerListCache.at < 6 * 3600e3 && brokerListCache.data.length) return brokerListCache.data;
+  const r = await snap.referenceData.listAllBrokerages();
+  const data = (r.data || []).filter(b => b.enabled !== false).map(b => ({
+    slug: b.slug, name: b.display_name || b.name, logo: b.aws_s3_square_logo_url || b.aws_s3_logo_url || null, wideLogo: b.aws_s3_logo_url || null,
+    maintenance: !!b.maintenance_mode
+  })).sort((a, b) => a.name.localeCompare(b.name));
+  brokerListCache = { at: Date.now(), data };
+  return data;
+}
+
+// ---- movers: rolling quote cache for the universe ----
+const moversCache = new Map(); // symbol -> {price, prevClose, changePct, high, low, at}
+let moversIdx = 0;
+async function moversTick() {
+  if (!FINNHUB_KEY) return;
+  const sym = MOVERS_UNIVERSE[moversIdx++ % MOVERS_UNIVERSE.length];
+  try {
+    const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${sym}&token=${FINNHUB_KEY}`);
+    const q = await r.json();
+    if (r.ok && typeof q.c === 'number' && q.c > 0) moversCache.set(sym, { symbol: sym, price: q.c, prevClose: q.pc, changePct: q.dp, high: q.h, low: q.l, at: Date.now() });
+  } catch (e) { /* skip */ }
+}
+// 1 request every 6s = 10/min, well under the 60/min free limit; full universe refreshes every ~5 minutes.
+setInterval(moversTick, 6000); for (let i = 0; i < 5; i++) setTimeout(moversTick, i * 800);
+function moversList() {
+  return [...moversCache.values()].filter(x => typeof x.changePct === 'number').sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct));
 }
 
 function json(res, code, obj) { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); }
@@ -283,9 +317,20 @@ Rules: all price levels must be plausible relative to the CURRENT PRICE given (t
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'content-type');
+  res.setHeader('Access-Control-Allow-Headers', 'content-type, x-peekline-key');
   if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
   const url = new URL(req.url, 'http://x');
+  // ---- app secret (all app-only routes) ----
+  const appOnly = url.pathname.startsWith('/brokerage/') || url.pathname === '/me' || url.pathname === '/analyze' || url.pathname === '/movers';
+  if (appOnly && APP_SECRET && req.headers['x-peekline-key'] !== APP_SECRET) return json(res, 401, { error: 'unauthorized' });
+
+  if (url.pathname === '/movers') {
+    return json(res, 200, { asOf: Date.now(), universe: MOVERS_UNIVERSE.length, movers: moversList() });
+  }
+  if (url.pathname === '/brokerage/list') {
+    if (!snap) return json(res, 503, { error: 'SnapTrade keys not set' });
+    try { return json(res, 200, { brokerages: await listBrokerages() }); } catch (e) { return json(res, 502, { error: 'could not load brokerages', detail: String(e.message).slice(0, 200) }); }
+  }
   // ---- brokerage routes ----
   if (url.pathname.startsWith('/brokerage/') || url.pathname === '/me') {
     if (!db) return json(res, 503, { error: 'database not configured' });
