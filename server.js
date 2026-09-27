@@ -32,6 +32,23 @@ const FREE_BETA = !['0', 'false', 'off', 'no'].includes(String(process.env.FREE_
 const BETA_DAILY_ANALYSES = Number(process.env.BETA_DAILY_ANALYSES || 3); // chart/holding analyses (with or without image)
 const BETA_DAILY_EXPLAINS = Number(process.env.BETA_DAILY_EXPLAINS || 3); // "Explain my portfolio"
 const BETA_DAILY_GRADES = Number(process.env.BETA_DAILY_GRADES || 3);     // trade-grading runs
+// Cost safety for the public website: device ids are easy to fake, so the beta also limits per internet
+// connection (IP) and caps all AI requests per day. Counted in memory; resets daily and on restart.
+const BETA_DAILY_PER_IP = Number(process.env.BETA_DAILY_PER_IP || 10);             // per IP, per kind (analyses / explains / grades)
+const BETA_GLOBAL_DAILY_AI = Number(process.env.BETA_GLOBAL_DAILY_AI || 300);      // all AI requests from everyone, per day
+const aiCounts = { day: '', ip: new Map(), total: 0 };
+const clientIp = req => String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+// Returns a message if this AI request should be refused, otherwise counts it and returns null. Paid mode: no-op.
+function betaCostGuard(req, kind) {
+  if (!FREE_BETA) return null;
+  const day = new Date().toISOString().slice(0, 10);
+  if (aiCounts.day !== day) { aiCounts.day = day; aiCounts.ip.clear(); aiCounts.total = 0; }
+  if (aiCounts.total >= BETA_GLOBAL_DAILY_AI) return 'Peekline’s free beta has reached today’s capacity. Please try again tomorrow.';
+  const key = kind + ':' + clientIp(req), n = aiCounts.ip.get(key) || 0;
+  if (n >= BETA_DAILY_PER_IP) return 'Too many free beta requests from this connection today. Please try again tomorrow.';
+  aiCounts.ip.set(key, n + 1); aiCounts.total++;
+  return null;
+}
 console.log('free beta:', FREE_BETA ? `ON (limits ${BETA_DAILY_ANALYSES}/${BETA_DAILY_EXPLAINS}/${BETA_DAILY_GRADES} per day)` : 'off');
 // Universe for "Top stocks of the day": the most-traded US names. Refreshed every 5 min within Finnhub's rate limit.
 const MOVERS_UNIVERSE = ['NVDA','TSLA','AAPL','AMD','PLTR','META','AMZN','MSFT','GOOGL','COIN','NBIS','SOFI','HOOD','MSTR','AVGO','NFLX','INTC','SMCI','MU','ARM','UBER','SHOP','CRWD','PANW','SNOW','RIVN','LCID','NIO','BABA','JPM','BAC','XOM','CVX','WMT','COST','DIS','BA','PFE','MRNA','LLY','UNH','V','MA','PYPL','SQ','SPY','QQQ','IWM','GLD','TLT'];
@@ -469,8 +486,26 @@ function moversList() {
 
 function json(res, code, obj) { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); }
 
-// Public web pages the App Store needs: /privacy, /terms, /support (files in ./legal). Loaded once at startup.
 const fs = require('fs'), path = require('path');
+
+// The Peekline website: the Expo web build in ./web (built from the app repo with `npm run build:web`).
+// Served at "/" plus its /_expo/ assets; every API route above takes priority.
+const WEB_DIR = path.join(__dirname, 'web');
+const WEB_TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css', '.json': 'application/json', '.ico': 'image/x-icon', '.png': 'image/png', '.svg': 'image/svg+xml', '.ttf': 'font/ttf', '.woff': 'font/woff', '.woff2': 'font/woff2' };
+function serveWeb(req, res, pathname) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') return false;
+  const rel = pathname === '/' ? '/index.html' : decodeURIComponent(pathname);
+  const file = path.normalize(path.join(WEB_DIR, rel));
+  if (!file.startsWith(WEB_DIR + path.sep)) return false;
+  let st; try { st = fs.statSync(file); } catch { return false; }
+  if (!st.isFile()) return false;
+  // Build files under /_expo/ have content hashes in their names, so browsers may cache them forever.
+  res.writeHead(200, { 'Content-Type': WEB_TYPES[path.extname(file)] || 'application/octet-stream', 'Cache-Control': rel.startsWith('/_expo/') ? 'public, max-age=31536000, immutable' : 'no-cache' });
+  if (req.method === 'HEAD') { res.end(); return true; }
+  fs.createReadStream(file).pipe(res); return true;
+}
+
+// Public web pages the App Store needs: /privacy, /terms, /support (files in ./legal). Loaded once at startup.
 const PAGES = {};
 for (const name of ['privacy', 'terms', 'support']) {
   try { PAGES[name] = fs.readFileSync(path.join(__dirname, 'legal', `${name}.html`)); }
@@ -722,6 +757,7 @@ const server = http.createServer(async (req, res) => {
         const key = `${deviceId}:grades`, hit = briefCache.get(key);
         if (hit && Date.now() - hit.at < 10 * 60e3) return json(res, 200, { closed: hit.data });
         if (FREE_BETA && (await getUsage(deviceId)).gradeCount >= BETA_DAILY_GRADES) return json(res, 200, { closed: ungraded(), gradeLimit: `You've used today's ${BETA_DAILY_GRADES} free beta trade reviews. They reset at midnight Eastern.` });
+        const gradeGuard = betaCostGuard(req, 'grade'); if (gradeGuard) return json(res, 200, { closed: ungraded(), gradeLimit: gradeGuard });
         const graded = await gradeTrades(closed);
         briefCache.set(key, { at: Date.now(), data: graded });
         if (graded.some(t => t.grade)) await bumpUsage(deviceId, 'grade');
@@ -743,6 +779,8 @@ const server = http.createServer(async (req, res) => {
         if (!user.snap_user_id) return json(res, 400, { error: 'no brokerage connected' });
         if (!ANTHROPIC_API_KEY) return json(res, 503, { error: 'ANTHROPIC_API_KEY not set' });
         const usage = await getUsage(deviceId), explainLimit = FREE_BETA ? BETA_DAILY_EXPLAINS : EXPLAIN_DAILY_LIMIT;
+        const explainGuard = usage.explainCount < explainLimit ? betaCostGuard(req, 'explain') : null;
+        if (explainGuard) return json(res, 429, { error: 'beta capacity', detail: explainGuard });
         if (usage.explainCount >= explainLimit) return json(res, 429, { error: 'daily limit', detail: FREE_BETA ? `You've used today's ${explainLimit} free beta portfolio explanations. They reset at midnight Eastern.` : `You've reached today's limit of ${explainLimit} portfolio explanations. It resets at midnight Eastern.` });
         let out;
         try { out = await explainPortfolio(user, body.question); }
@@ -775,6 +813,7 @@ const server = http.createServer(async (req, res) => {
       if (db && deviceId) {
         usage = await getUsage(deviceId);
         if (FREE_BETA && usage.remaining <= 0) return json(res, 429, { error: 'daily limit', detail: `You've used today's ${BETA_DAILY_ANALYSES} free beta analyses. They reset at midnight Eastern.`, usage });
+        const guard = betaCostGuard(req, 'analysis'); if (guard) return json(res, 429, { error: 'beta capacity', detail: guard, usage });
         if (!FREE_BETA && withImage && usage.remaining <= 0) return json(res, 429, { error: 'daily limit', detail: `You've reached today's fair-use limit of ${DAILY_IMAGE_LIMIT} chart analyses. It resets at midnight Eastern.`, usage });
       }
       const st = body.strategy && typeof body.strategy === 'object' ? { name: String(body.strategy.name || '').slice(0, 60), style: String(body.strategy.style || '').slice(0, 40), trigger: String(body.strategy.trigger || '').slice(0, 120), stop: String(body.strategy.stop || '').slice(0, 120), target: String(body.strategy.target || '').slice(0, 120), notes: String(body.strategy.notes || '').slice(0, 300) } : null;
@@ -798,6 +837,7 @@ const server = http.createServer(async (req, res) => {
     } catch (e) { res.writeHead(502, {'Content-Type':'application/json'}); res.end(JSON.stringify({error:'upstream failed'})); }
     return;
   }
+  if (serveWeb(req, res, url.pathname)) return;
   res.writeHead(200, {'Content-Type':'text/plain'}); res.end('Peekline relay OK');
 });
 const wss = new WebSocket.Server({ server });
