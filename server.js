@@ -697,7 +697,7 @@ const server = http.createServer(async (req, res) => {
   const page = PAGES[url.pathname.replace(/^\/|\.html$|\/$/g, '')];
   if (req.method === 'GET' && page) { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=300' }); return res.end(page); }
   // ---- app secret (all app-only routes) ----
-  const appOnly = url.pathname.startsWith('/brokerage/') || url.pathname === '/me' || url.pathname === '/analyze' || url.pathname === '/movers' || url.pathname === '/waitlist';
+  const appOnly = url.pathname.startsWith('/brokerage/') || url.pathname === '/me' || url.pathname === '/analyze' || url.pathname === '/movers' || url.pathname === '/waitlist' || url.pathname === '/me/delete';
   if (appOnly && APP_SECRET && req.headers['x-peekline-key'] !== APP_SECRET) return json(res, 401, { error: 'unauthorized' });
 
   // What mode the app should run in. Public and read-only.
@@ -726,6 +726,28 @@ const server = http.createServer(async (req, res) => {
     if (!snap) return json(res, 503, { error: 'SnapTrade keys not set' });
     try { return json(res, 200, { brokerages: await listBrokerages() }); } catch (e) { return json(res, 502, { error: 'could not load brokerages', detail: String(e.message).slice(0, 200) }); }
   }
+  // ---- "Delete my data": removes everything the server stores for this install ----
+  // (brokerage connection at SnapTrade, account row, usage counts, waitlist email, in-memory caches)
+  if (url.pathname === '/me/delete' && req.method === 'POST') {
+    if (!db) return json(res, 503, { error: 'database not configured' });
+    let body; try { body = JSON.parse(await readBody(req, 1e4) || '{}'); } catch { return json(res, 400, { error: 'bad json' }); }
+    const deviceId = body.deviceId;
+    if (!isDeviceId(deviceId)) return json(res, 400, { error: 'deviceId required' });
+    try {
+      const u = (await db.query('SELECT snap_user_id, snap_user_secret FROM users WHERE device_id=$1', [deviceId])).rows[0];
+      if (u?.snap_user_id && snap) {
+        try { await snap.authentication.deleteSnapTradeUser(creds(u)); }
+        catch (e) { console.error('delete: snaptrade', e.response?.status, e.message); return json(res, 502, { error: 'delete failed', detail: 'Couldn’t remove your brokerage connection right now. Nothing was deleted — please try again.' }); }
+      }
+      const usage = await db.query('DELETE FROM usage WHERE device_id=$1', [deviceId]);
+      const wait = await db.query('DELETE FROM waitlist WHERE device_id=$1', [deviceId]);
+      const user = await db.query('DELETE FROM users WHERE device_id=$1', [deviceId]);
+      forgetUser(deviceId); briefCache.delete(`${deviceId}:grades`);
+      console.log('delete my data: done', { brokerage: !!u?.snap_user_id, usageRows: usage.rowCount, waitlist: wait.rowCount, user: user.rowCount });
+      return json(res, 200, { ok: true, deleted: { brokerage: !!u?.snap_user_id, usageDays: usage.rowCount, waitlist: wait.rowCount > 0, account: user.rowCount > 0 } });
+    } catch (e) { console.error('delete failed', e.message); return json(res, 500, { error: 'delete failed', detail: 'Something went wrong while deleting. Please try again or contact support.' }); }
+  }
+
   // ---- brokerage routes ----
   if (url.pathname.startsWith('/brokerage/') || url.pathname === '/me') {
     if (!db) return json(res, 503, { error: 'database not configured' });
