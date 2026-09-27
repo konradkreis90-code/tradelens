@@ -385,15 +385,19 @@ async function explainPortfolio(user, question) {
     `Upcoming earnings (30 days) for holdings: ${ov.earnings.map(e => `${e.symbol} ${e.date}${e.hour ? ' ' + e.hour : ''}`).join(', ') || 'none found'}.`,
     `Recent headlines:\n${Object.entries(news).map(([s, l]) => l.map(n => `${s}: ${n.headline} (${n.source}, ${n.date})`).join('\n')).filter(Boolean).join('\n') || 'none'}`,
   ].filter(Boolean).join('\n\n');
-  const system = `You explain a retail investor's brokerage portfolio in plain English for education. Use ONLY the numbers and facts provided; never invent prices, news, or events, and say when data is missing. Point out concentration (single holdings over ~20% or sectors over ~35% of invested value), big winners/losers, what drove today's change, upcoming earnings, and how the day compares with SPY. Be balanced and humble; this is not financial advice. Never tell the user to buy, sell, or hold anything; if asked for a recommendation, say you can't give one and explain what in their portfolio is worth thinking about instead. Always answer by calling the portfolio_explanation tool.`;
+  const system = `You explain a retail investor's brokerage portfolio in plain English for education. Use ONLY the numbers and facts provided; never invent prices, news, or events, and say when data is missing. Point out concentration (single holdings over ~20% or sectors over ~35% of invested value), big winners/losers, what drove today's change, upcoming earnings, and how the day compares with SPY. Be balanced and humble; this is not financial advice. Never tell the user to buy, sell, or hold anything; if asked for a recommendation, say you can't give one and explain what in their portfolio is worth thinking about instead.
+STYLE: organized and simple. Write for someone new to investing: everyday words, short sentences (under 20 words), no jargon (if a term is unavoidable, explain it in a few words). Use real numbers with $ and %. Every bullet is one idea.
+If the user asked a question: answer it directly first (2-3 short sentences), and keep the sections to the 1-3 that help with that question. With no question: cover Today, Biggest movers, Concentration, and Coming up (skip any with nothing to say).
+Always answer by calling the portfolio_explanation tool.`;
   const userText = `${context}${question ? `\n\nUser's question: ${String(question).slice(0, 300)}` : ''}`;
   // A forced tool call makes the model return a structured object instead of free text we'd have to parse.
-  const tool = { name: 'portfolio_explanation', description: 'Return the portfolio explanation.', input_schema: { type: 'object', required: ['headline', 'summary', 'points', 'scenarios', 'answer'], properties: {
-    headline: { type: 'string', description: "One sentence with today's move and the biggest driver." },
-    summary: { type: 'string', description: '3-5 sentences.' },
-    points: { type: 'array', items: { type: 'string' }, description: '3-6 short bullets.' },
-    scenarios: { type: 'array', description: '2-3 items describing exposure only, no predictions.', items: { type: 'object', required: ['name', 'text'], properties: { name: { type: 'string', description: 'e.g. "If the market falls" or "If NVDA reports earnings"' }, text: { type: 'string' } } } },
-    answer: { type: 'string', description: "Answer to the user's question, or empty string if none." },
+  const tool = { name: 'portfolio_explanation', description: 'Return the portfolio explanation.', input_schema: { type: 'object', required: ['headline', 'answer', 'sections'], properties: {
+    headline: { type: 'string', description: "One short sentence (max 15 words), e.g. \"You're up $312 today, mostly from NVDA.\"" },
+    answer: { type: 'string', description: "Direct answer to the user's question in 2-3 short sentences, or empty string if there was no question." },
+    sections: { type: 'array', description: '1-4 sections.', items: { type: 'object', required: ['title', 'bullets'], properties: {
+      title: { type: 'string', enum: ['Today', 'Biggest movers', 'Concentration', 'Coming up', 'What if…', 'Worth knowing'] },
+      bullets: { type: 'array', items: { type: 'string' }, description: '1-3 bullets, each one short sentence (max 20 words). "What if…" bullets describe exposure only, never predictions.' },
+    } } },
   } } };
   let j = null;
   for (let attempt = 0; attempt < 2 && !j; attempt++) {
@@ -407,9 +411,10 @@ async function explainPortfolio(user, question) {
   if (!j) throw new Error('no explanation');
   const str = v => String(v || '');
   return {
-    headline: str(j.headline), summary: str(j.summary), answer: str(j.answer),
-    points: (Array.isArray(j.points) ? j.points : []).slice(0, 6).map(str).filter(Boolean),
-    scenarios: (Array.isArray(j.scenarios) ? j.scenarios : []).slice(0, 3).map(s => ({ name: str(s?.name), text: str(s?.text) })).filter(s => s.text),
+    headline: str(j.headline), answer: str(j.answer), question: question ? String(question).slice(0, 300) : '',
+    sections: (Array.isArray(j.sections) ? j.sections : []).slice(0, 4)
+      .map(s => ({ title: str(s?.title), bullets: (Array.isArray(s?.bullets) ? s.bullets : []).slice(0, 3).map(str).filter(Boolean) }))
+      .filter(s => s.title && s.bullets.length),
     at: Date.now(), engine: ANTHROPIC_MODEL,
   };
 }
