@@ -44,6 +44,13 @@ async function initDb() {
     PRIMARY KEY (device_id, day)
   )`);
   console.log('db ready');
+  pruneUsage(); setInterval(pruneUsage, 24 * 3600e3);
+}
+// Privacy policy promise: daily usage counts are kept for 90 days, then deleted.
+function pruneUsage() {
+  db.query(`DELETE FROM usage WHERE day < (now() AT TIME ZONE 'America/New_York')::date - 90`)
+    .then(r => { if (r.rowCount) console.log('pruned', r.rowCount, 'old usage rows'); })
+    .catch(e => console.error('prune usage failed', e.message));
 }
 async function getUsage(deviceId) {
   const r = await db.query(`SELECT image_count, text_count FROM usage WHERE device_id=$1 AND day=(now() AT TIME ZONE 'America/New_York')::date`, [deviceId]);
@@ -115,26 +122,27 @@ async function accountPositions(user, accountId) {
   return tryChain([
     async () => { const r = await snap.accountInformation.getAllAccountPositions({ ...creds(user), accountId });
       const d = r.data || {}; const list = Array.isArray(d) ? d : (d.results || d.positions || []);
-      console.log('positions/all keys:', Object.keys(d).join(','), '| entries:', list.length, list.length ? '| sample: ' + JSON.stringify(list[0]).slice(0, 500) : '');
+      console.log('positions/all keys:', Object.keys(d).join(','), '| entries:', list.length);
       return list; },
     async () => { const r = await snap.accountInformation.getUserAccountPositions({ ...creds(user), accountId }); return r.data || []; },
   ]);
 }
 async function listPositions(user) {
   const accts = (await snap.accountInformation.listUserAccounts(creds(user))).data || [];
-  console.log('accounts:', JSON.stringify(accts.map(a => ({ id: a.id, name: a.name, inst: a.institution_name, number: a.number ? '…' + String(a.number).slice(-4) : null, type: a.meta?.type || a.raw_type || null, sync: a.sync_status || null }))).slice(0, 600));
+  // Privacy: log counts and types only, never account numbers, holdings, or prices.
+  console.log('accounts:', accts.length, JSON.stringify(accts.map(a => ({ type: a.meta?.type || a.raw_type || null, sync: a.sync_status || null }))).slice(0, 300));
   const out = [];
   for (const a of accts) {
     let pos = [];
     try { pos = await accountPositions(user, a.id); } catch (e) { console.error('positions', a.id, e.response?.status, e.message); }
-    console.log(`positions: account ${a.id} (${a.institution_name || a.name}) returned ${pos.length} raw`);
-    if (pos.length) console.log('positions sample:', JSON.stringify(pos[0]).slice(0, 400));
+    console.log(`positions: an account returned ${pos.length} raw`);
+    if (pos.length) console.log('positions sample keys:', Object.keys(pos[0]).join(','));
     for (const p of pos) {
       const kind = String(p.type || p.instrument?.type || p.symbol?.type?.code || '').toUpperCase();
       if (kind.includes('OPTION')) continue; // options come later
       const sym = p.instrument?.symbol || p.instrument?.ticker || p.symbol?.symbol?.symbol || p.symbol?.symbol?.raw_symbol || p.symbol?.raw_symbol || (typeof p.symbol === 'string' ? p.symbol : p.symbol?.symbol) || p.symbol?.ticker || p.ticker || null;
       const qty = Number(p.units ?? p.quantity ?? p.fractional_units ?? 0);
-      if (!sym || !(qty > 0)) { console.log('skipped position', JSON.stringify(p).slice(0, 200)); continue; }
+      if (!sym || !(qty > 0)) { console.log('skipped position; keys:', Object.keys(p).join(',')); continue; }
       const n = v => (v == null || v === '' ? null : (isFinite(Number(v)) ? Number(v) : null));
       out.push({ symbol: String(sym).toUpperCase(), qty, avgCost: n(p.average_purchase_price ?? p.average_cost ?? p.cost_basis_per_unit), brokerPrice: n(p.price ?? p.last_price), account: a.name || a.institution_name || '' });
     }
@@ -160,7 +168,7 @@ async function listTrades(user, days = 730) {
       acts = acts.concat(page);
     } catch (e) { console.error('activities', a.id, e.response?.status, e.message); }
   }
-  console.log(`activities: ${acts.length} raw across ${accts.length} account(s); types: ${[...new Set(acts.map(a => a.type))].join(',') || 'none'}`, acts.length ? '| sample: ' + JSON.stringify(acts[0]).slice(0, 400) : '');
+  console.log(`activities: ${acts.length} raw across ${accts.length} account(s); types: ${[...new Set(acts.map(a => a.type))].join(',') || 'none'}`, acts.length ? '| sample keys: ' + Object.keys(acts[0]).join(',') : '');
   const fills = acts.filter(a => ['BUY', 'SELL'].includes(String(a.type || '').toUpperCase()) && a.units && a.price)
     .map(a => ({ symbol: String(a.instrument?.symbol || a.symbol?.symbol || a.symbol?.raw_symbol || (typeof a.symbol === 'string' ? a.symbol : '') || a.option_symbol?.ticker || '').toUpperCase(), side: String(a.type).toUpperCase(), qty: Math.abs(Number(a.units)), price: Number(a.price), date: (a.trade_date || a.settlement_date || '').slice(0, 10) }))
     .filter(f => f.symbol && f.qty > 0 && f.price > 0).sort((x, y) => x.date < y.date ? -1 : 1);
@@ -227,6 +235,14 @@ function moversList() {
 }
 
 function json(res, code, obj) { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); }
+
+// Public web pages the App Store needs: /privacy, /terms, /support (files in ./legal). Loaded once at startup.
+const fs = require('fs'), path = require('path');
+const PAGES = {};
+for (const name of ['privacy', 'terms', 'support']) {
+  try { PAGES[name] = fs.readFileSync(path.join(__dirname, 'legal', `${name}.html`)); }
+  catch (e) { console.error('missing page', name, e.message); }
+}
 const PORT = process.env.PORT || 8080;
 if (!FINNHUB_KEY) { console.error('Set FINNHUB_KEY'); process.exit(1); }
 
@@ -410,6 +426,8 @@ const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Headers', 'content-type, x-peekline-key');
   if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
   const url = new URL(req.url, 'http://x');
+  const page = PAGES[url.pathname.replace(/^\/|\.html$|\/$/g, '')];
+  if (req.method === 'GET' && page) { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=300' }); return res.end(page); }
   // ---- app secret (all app-only routes) ----
   const appOnly = url.pathname.startsWith('/brokerage/') || url.pathname === '/me' || url.pathname === '/analyze' || url.pathname === '/movers';
   if (appOnly && APP_SECRET && req.headers['x-peekline-key'] !== APP_SECRET) return json(res, 401, { error: 'unauthorized' });
