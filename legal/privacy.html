@@ -27,6 +27,7 @@
 <tr><td><b>Chart images</b> you upload, photograph, or capture in the app, plus the ticker, price, time horizon, and trading strategy you choose.</td><td>To produce the analysis you asked for.</td><td>Our server passes it to our AI provider, Anthropic, and returns the result. We do not save your images or analyses on our server; your analysis history is kept only on your phone.</td></tr>
 <tr><td><b>Usage counts</b> — how many analyses you have run today.</td><td>To apply the free-analysis limit and the fair-use limit of 25 image analyses per day.</td><td>Our server.</td></tr>
 <tr><td><b>Brokerage data</b> (only if you choose to connect) — account names, balances (total value, cash, buying power), account value history and returns, positions and cost basis, orders, and account activity such as trades, dividends, deposits, and withdrawals.</td><td>To show your portfolio, orders, and activity, grade your closed trades, and explain your portfolio when you ask.</td><td>Fetched live from SnapTrade when you open these screens and not saved to our database (our server keeps it in memory for a few minutes so screens load quickly). To grade trades, the trade details (ticker, share count, entry and exit prices and dates) are sent to Anthropic. When you use <b>Explain my portfolio</b>, your holdings, balances, returns, and your question are sent to Anthropic. The ticker symbols you hold are sent to Finnhub to look up sectors, earnings dates, and headlines. We store only the connection's ID and access key, never your broker login.</td></tr>
+<tr><td><b>Your email</b> — only if you join the Peekline Pro waitlist.</td><td>To tell you when Peekline Pro launches. Nothing else, and never sold or shared.</td><td>Our server's database, until you ask us to remove it or the waitlist ends.</td></tr>
 <tr><td><b>Purchase information</b> — which plan you have and when it renews. We never see your card or Apple ID details; Apple handles payment.</td><td>To unlock Peekline Pro.</td><td>Apple and RevenueCat.</td></tr>
 </table>
 
@@ -50,6 +51,7 @@
 <ul>
 <li><b>Chart images, analyses, and brokerage data (balances, positions, orders, activity):</b> not stored in our database; brokerage data is held in server memory for at most about 10 minutes.</li>
 <li><b>Daily analysis counts:</b> deleted automatically after 90 days.</li>
+<li><b>Waitlist email:</b> kept until Peekline Pro launches and we've told you, or until you ask us to remove it.</li>
 <li><b>Your app ID:</b> kept while you use Peekline, so your connection and limits keep working. Ask us to delete it any time.</li>
 <li><b>Brokerage connection:</b> kept until you disconnect. Disconnecting deletes your SnapTrade user and the stored access key.</li>
 <li><b>Server logs:</b> our hosting keeps short-lived technical logs for troubleshooting. They record things like request counts and errors, not your holdings, prices, or account numbers.</li>
