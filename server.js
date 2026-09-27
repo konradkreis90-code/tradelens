@@ -351,7 +351,27 @@ async function sectorOf(sym) {
     sectorCache.set(sym, { at: Date.now(), sector }); return sector;
   } catch { return 'Unclassified'; }
 }
+// ---- Crypto: symbols like BTC-USD. Prices from Coinbase's public market data (no key needed).
+// "prevClose" for crypto = the price 24 hours ago (Coinbase 24h open), so changePct is a 24-hour change.
+const isCrypto = s => /^[A-Z0-9]{2,10}-USD$/.test(s);
+const cbTicker = new Map(), cbStats = new Map();
+async function coinbaseJson(path) {
+  const r = await fetch(`https://api.exchange.coinbase.com${path}`, { headers: { 'User-Agent': 'Peekline/1.0' } });
+  if (!r.ok) return null; return r.json();
+}
+async function cryptoQuote(sym) {
+  const now = Date.now(), t = cbTicker.get(sym), st = cbStats.get(sym);
+  const [tick, stats] = await Promise.all([
+    t && now - t.at < 4e3 ? t.v : coinbaseJson(`/products/${sym}/ticker`).then(v => { cbTicker.set(sym, { at: now, v }); return v; }).catch(() => null),
+    st && now - st.at < 60e3 ? st.v : coinbaseJson(`/products/${sym}/stats`).then(v => { cbStats.set(sym, { at: now, v }); return v; }).catch(() => null),
+  ]);
+  const price = Number(tick?.price), open = Number(stats?.open);
+  if (!(price > 0)) return null;
+  return { price, prevClose: open > 0 ? open : null, changePct: open > 0 ? (price - open) / open * 100 : null, high: Number(stats?.high) || null, low: Number(stats?.low) || null, source: 'Coinbase' };
+}
+
 async function quoteOf(sym) {
+  if (isCrypto(sym)) return cryptoQuote(sym);
   const c = quoteCache.get(sym); if (c && Date.now() - c.at < 60e3) return c.q;
   try {
     const j = await (await fetch(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(sym)}&token=${FINNHUB_KEY}`)).json();
@@ -569,7 +589,7 @@ function subscribe(client, symbols) {
   for (let s of symbols) {
     s = String(s).toUpperCase().trim(); if (!s) continue;
     let set = watchers.get(s);
-    if (!set) { set = new Set(); watchers.set(s, set); upstreamSend({ type: 'subscribe', symbol: s }); }
+    if (!set) { set = new Set(); watchers.set(s, set); if (!isCrypto(s)) upstreamSend({ type: 'subscribe', symbol: s }); }
     set.add(client);
     client.symbols.add(s);
     const last = lastQuote.get(s);
@@ -582,21 +602,38 @@ async function sendSnapshot(client, symbols) {
   for (let s of symbols) {
     s = String(s).toUpperCase().trim(); if (!/^[A-Z0-9.\-]{1,12}$/.test(s)) continue;
     try {
-      const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${s}&token=${FINNHUB_KEY}`);
-      const q = await r.json();
-      if (!r.ok || typeof q.c !== 'number' || q.c === 0) continue;
-      const quote = { type: 'quote', symbol: s, price: q.c, prevClose: q.pc, changePct: q.dp, ts: Date.now(), snapshot: true };
+      let quote;
+      if (isCrypto(s)) { const q = await cryptoQuote(s); if (!q) continue; quote = { type: 'quote', symbol: s, price: q.price, prevClose: q.prevClose, changePct: q.changePct, ts: Date.now(), snapshot: true }; }
+      else {
+        const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${s}&token=${FINNHUB_KEY}`);
+        const q = await r.json();
+        if (!r.ok || typeof q.c !== 'number' || q.c === 0) continue;
+        quote = { type: 'quote', symbol: s, price: q.c, prevClose: q.pc, changePct: q.dp, ts: Date.now(), snapshot: true };
+      }
       if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(quote));
     } catch (e) { /* skip symbol */ }
   }
 }
+
+// Live crypto: every 5 seconds, fetch prices for crypto symbols someone is watching and push them (max 30 symbols
+// to stay well inside Coinbase's public rate limits).
+setInterval(async () => {
+  const syms = [...watchers.keys()].filter(isCrypto).slice(0, 30);
+  for (const s of syms) {
+    const q = await cryptoQuote(s).catch(() => null); if (!q) continue;
+    const quote = { type: 'quote', symbol: s, price: q.price, prevClose: q.prevClose, changePct: q.changePct, ts: Date.now() };
+    lastQuote.set(s, quote);
+    const payload = JSON.stringify(quote);
+    for (const client of watchers.get(s) || []) if (client.readyState === WebSocket.OPEN) client.send(payload);
+  }
+}, 5000);
 
 function unsubscribe(client, symbols) {
   for (let s of symbols) {
     s = String(s).toUpperCase().trim();
     const set = watchers.get(s); if (!set) continue;
     set.delete(client); client.symbols.delete(s);
-    if (set.size === 0) { watchers.delete(s); upstreamSend({ type: 'unsubscribe', symbol: s }); }
+    if (set.size === 0) { watchers.delete(s); if (!isCrypto(s)) upstreamSend({ type: 'unsubscribe', symbol: s }); }
   }
 }
 
@@ -638,7 +675,10 @@ Return ONLY a JSON object, no prose, no markdown fences, with exactly these keys
 ${tf === '15m' || tf === '5m' || tf === '1m' ? `INTRADAY MODE (day trader): the trader wants precise, actionable numbers. Give every level to the cent. Use the chart's own structure: opening range high/low, prior-day high/low/close, VWAP or moving averages if drawn, obvious intraday swing points, round numbers. Keep the stop tight (typically 0.3%-1.5% from entry) and place it just beyond a real level, not an arbitrary distance. target must be the nearest realistic objective; target2 the next level beyond it. The trigger must be a concrete, observable condition (a break, a reclaim, a rejection at a level) with a price. If the chart does not show enough intraday detail to be precise, say so in the explanation and widen the entry instead of guessing.` : `SWING MODE: levels can be rounded sensibly; target2 may be null.`}
 Rules: all price levels must be plausible relative to the CURRENT PRICE given (typically within 40% of it). Support must be below current price and resistance above, unless the chart clearly shows otherwise. For a long setup: entryLo <= entryHi <= about current price, target > entryHi, stop < entryLo. For a short setup: reverse. If the image is not a price chart, set trend to "Neutral", pattern to "Not a chart", and explain that in one sentence.`;
   const stratText = strategy ? `\nTRADER'S STRATEGY: ${strategy.name}. Style: ${strategy.style}. Entry trigger: ${strategy.trigger}. Stop placement: ${strategy.stop}. Targets: ${strategy.target}.${strategy.notes ? ' Notes: ' + strategy.notes : ''}\nJudge the chart against THIS strategy: say plainly whether it fits (Strong/Partial/Poor) and why in one or two sentences, and shape trigger, stop and targets to match the strategy's rules. If the chart does not fit, still give the levels the strategy would need to see before entering.` : '';
-  const userText = `Ticker: ${ticker}\nCURRENT PRICE (live): ${price}${typeof changePct === 'number' ? `\nChange today: ${changePct.toFixed(2)}%` : ''}\nTrader's preferred timeframe: ${tf}${stratText}${imageBase64 ? '\nA chart image is attached. Read the actual levels from it.' : '\nNo chart image was provided; analyze from ticker and price context only and say so.'}`;
+  const crypto = isCrypto(ticker);
+  const cryptoNote = crypto ? ' (a cryptocurrency priced in US dollars; it trades 24/7, so there is no market open or close, no premarket, and no earnings; "change" means the last 24 hours)' : '';
+  const precisionNote = price < 1 ? '\nPRICE PRECISION: the price is under $1, so give every level with 4-6 decimal places; never round to cents.' : '';
+  const userText = `Ticker: ${ticker}${cryptoNote}${precisionNote}\nCURRENT PRICE (live): ${price}${typeof changePct === 'number' ? `\nChange ${crypto ? 'last 24h' : 'today'}: ${changePct.toFixed(2)}%` : ''}\nTrader's preferred timeframe: ${tf}${stratText}${imageBase64 ? '\nA chart image is attached. Read the actual levels from it.' : '\nNo chart image was provided; analyze from ticker and price context only and say so.'}`;
   const content = [];
   if (imageBase64) {
     // Detect the real format from the bytes; phones often mislabel JPEGs as PNGs.
@@ -850,6 +890,12 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === '/quote') {
     const symbol = String(url.searchParams.get('symbol') || '').toUpperCase().trim();
     if (!/^[A-Z0-9.\-]{1,12}$/.test(symbol)) { res.writeHead(400, {'Content-Type':'application/json'}); return res.end('{"error":"bad symbol"}'); }
+    if (isCrypto(symbol)) {
+      const q = await cryptoQuote(symbol).catch(() => null);
+      if (!q) { res.writeHead(404, {'Content-Type':'application/json'}); return res.end(JSON.stringify({ error: 'no quote', symbol })); }
+      res.writeHead(200, {'Content-Type':'application/json', 'Cache-Control':'no-store'});
+      return res.end(JSON.stringify({ symbol, price: q.price, change: q.prevClose ? q.price - q.prevClose : null, changePct: q.changePct, high: q.high, low: q.low, open: q.prevClose, prevClose: q.prevClose, ts: Date.now(), source: 'Coinbase', window: '24h' }));
+    }
     try {
       const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${symbol}&token=${FINNHUB_KEY}`);
       const q = await r.json();
