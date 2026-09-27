@@ -155,7 +155,12 @@ async function listPositions(user) {
       const qty = Number(p.units ?? p.quantity ?? p.fractional_units ?? 0);
       if (!sym || !(qty > 0)) { console.log('skipped position; keys:', Object.keys(p).join(',')); continue; }
       const n = v => (v == null || v === '' ? null : (isFinite(Number(v)) ? Number(v) : null));
-      out.push({ symbol: String(sym).toUpperCase(), qty, avgCost: n(p.average_purchase_price ?? p.average_cost ?? p.cost_basis_per_unit), brokerPrice: n(p.price ?? p.last_price), account: a.name || a.institution_name || '' });
+      // Average cost per share. Current SnapTrade API: `cost_basis` = "book price or average purchase price" (per share);
+      // older fields kept for fallback; last resort: weighted average of the tax lots.
+      const lots = Array.isArray(p.tax_lots) ? p.tax_lots.filter(l => n(l.quantity) > 0 && n(l.purchased_price) != null) : [];
+      const lotAvg = lots.length ? lots.reduce((s, l) => s + n(l.purchased_price) * n(l.quantity), 0) / lots.reduce((s, l) => s + n(l.quantity), 0) : null;
+      const avgCost = n(p.average_purchase_price ?? p.average_cost ?? p.cost_basis_per_unit ?? p.cost_basis) ?? lotAvg;
+      out.push({ symbol: String(sym).toUpperCase(), qty, avgCost, brokerPrice: n(p.price ?? p.last_price), account: a.name || a.institution_name || '' });
     }
   }
   if (!out.length) await refreshConnections(user); // empty holdings right after connecting usually means the broker sync hasn't run yet
@@ -214,14 +219,17 @@ async function listTrades(user) {
 
 async function gradeTrades(closed) {
   if (!ANTHROPIC_API_KEY || !closed.length) return closed.map(t => ({ ...t, grade: null, why: '' }));
-  const system = `You grade a retail trader's closed stock trades for education. For each trade give a letter grade A, B or C and a 1-2 sentence "why" in plain English that a beginner understands. Judge: was the entry at a sensible level relative to the move, was risk defined and proportionate, was the exit disciplined (took profit / cut loss) or emotional. You only know entry, exit, dates and size, so be fair about uncertainty and never invent chart details. Return ONLY JSON: {"grades":[{"i":index,"grade":"A|B|C","why":"..."}]}`;
-  const list = closed.map((t, i) => t.entry == null ? `${i}: ${t.symbol} SELL ${t.qty} sh at ${t.exit} on ${t.exitDate} (entry unknown: bought before history window) - grade null` : `${i}: ${t.symbol} ${t.side} ${t.qty} sh, in ${t.entry} on ${t.entryDate}, out ${t.exit} on ${t.exitDate}, P/L ${t.plPct.toFixed(1)}%`).join('\n');
+  const system = `You grade a retail trader's closed stock trades for education. For each trade give a letter grade A, B or C and a 1-2 sentence "why" in plain English that a beginner understands. Judge: was the entry at a sensible level relative to the move, was risk defined and proportionate, was the exit disciplined (took profit / cut loss) or emotional. You only know entry, exit, dates and size, so be fair about uncertainty and never invent chart details. Always answer by calling the trade_grades tool.`;
+  const list = closed.map((t, i) => t.entry == null ? `${i}: ${t.symbol} SELL ${t.qty} sh at ${t.exit} on ${t.exitDate} (entry unknown: bought before history window) - grade none` : `${i}: ${t.symbol} ${t.side} ${t.qty} sh, in ${t.entry} on ${t.entryDate}, out ${t.exit} on ${t.exitDate}, P/L ${t.plPct.toFixed(1)}%`).join('\n');
+  const tool = { name: 'trade_grades', description: 'Return a grade for each trade.', input_schema: { type: 'object', required: ['grades'], properties: {
+    grades: { type: 'array', items: { type: 'object', required: ['i', 'grade', 'why'], properties: { i: { type: 'integer' }, grade: { type: 'string', enum: ['A', 'B', 'C', 'none'], description: '"none" when the entry is unknown' }, why: { type: 'string' } } } },
+  } } };
   const res = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: ANTHROPIC_MODEL, max_tokens: 6000, system, messages: [{ role: 'user', content: list }] }) });
+    body: JSON.stringify({ model: ANTHROPIC_MODEL, max_tokens: 6000, system, tools: [tool], tool_choice: { type: 'tool', name: tool.name }, messages: [{ role: 'user', content: list }] }) });
   if (!res.ok) { console.error('grade model', res.status); return closed.map(t => ({ ...t, grade: null, why: '' })); }
-  const data = await res.json(); const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
-  let j; try { j = JSON.parse(text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1)); }
-  catch (e) { console.error('grade parse failed:', e.message, '| stop_reason:', data.stop_reason); return closed.map(t => ({ ...t, grade: null, why: '' })); }
+  const data = await res.json();
+  const j = (data.content || []).find(b => b.type === 'tool_use' && b.name === tool.name)?.input;
+  if (!j || !Array.isArray(j.grades)) { console.error('grade: no tool output, stop_reason', data.stop_reason); return closed.map(t => ({ ...t, grade: null, why: '' })); }
   const by = new Map((j.grades || []).map(g => [g.i, g]));
   return closed.map((t, i) => ({ ...t, grade: ['A', 'B', 'C'].includes(by.get(i)?.grade) ? by.get(i).grade : null, why: String(by.get(i)?.why || '') }));
 }
@@ -377,14 +385,26 @@ async function explainPortfolio(user, question) {
     `Upcoming earnings (30 days) for holdings: ${ov.earnings.map(e => `${e.symbol} ${e.date}${e.hour ? ' ' + e.hour : ''}`).join(', ') || 'none found'}.`,
     `Recent headlines:\n${Object.entries(news).map(([s, l]) => l.map(n => `${s}: ${n.headline} (${n.source}, ${n.date})`).join('\n')).filter(Boolean).join('\n') || 'none'}`,
   ].filter(Boolean).join('\n\n');
-  const system = `You explain a retail investor's brokerage portfolio in plain English for education. Use ONLY the numbers and facts provided; never invent prices, news, or events, and say when data is missing. Point out concentration (single holdings over ~20% or sectors over ~35% of invested value), big winners/losers, what drove today's change, upcoming earnings, and how the day compares with SPY. Be balanced and humble; this is not financial advice and you must not tell the user to buy or sell.
-Return ONLY JSON: {"headline": string (one sentence with today's move and the biggest driver), "summary": string (3-5 sentences), "points": [string] (3-6 short bullets), "scenarios": [{"name": "If the market rises"|"If the market falls"|"If <holding> reports earnings", "text": string}] (2-3 items, describe exposure only, no predictions), "answer": string (answer to the user's question, or "" if none)}`;
+  const system = `You explain a retail investor's brokerage portfolio in plain English for education. Use ONLY the numbers and facts provided; never invent prices, news, or events, and say when data is missing. Point out concentration (single holdings over ~20% or sectors over ~35% of invested value), big winners/losers, what drove today's change, upcoming earnings, and how the day compares with SPY. Be balanced and humble; this is not financial advice. Never tell the user to buy, sell, or hold anything; if asked for a recommendation, say you can't give one and explain what in their portfolio is worth thinking about instead. Always answer by calling the portfolio_explanation tool.`;
   const userText = `${context}${question ? `\n\nUser's question: ${String(question).slice(0, 300)}` : ''}`;
-  const res = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: ANTHROPIC_MODEL, max_tokens: 1800, system, messages: [{ role: 'user', content: userText }] }) });
-  if (!res.ok) throw new Error(`model ${res.status}`);
-  const data = await res.json(); const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
-  const j = JSON.parse(text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1));
+  // A forced tool call makes the model return a structured object instead of free text we'd have to parse.
+  const tool = { name: 'portfolio_explanation', description: 'Return the portfolio explanation.', input_schema: { type: 'object', required: ['headline', 'summary', 'points', 'scenarios', 'answer'], properties: {
+    headline: { type: 'string', description: "One sentence with today's move and the biggest driver." },
+    summary: { type: 'string', description: '3-5 sentences.' },
+    points: { type: 'array', items: { type: 'string' }, description: '3-6 short bullets.' },
+    scenarios: { type: 'array', description: '2-3 items describing exposure only, no predictions.', items: { type: 'object', required: ['name', 'text'], properties: { name: { type: 'string', description: 'e.g. "If the market falls" or "If NVDA reports earnings"' }, text: { type: 'string' } } } },
+    answer: { type: 'string', description: "Answer to the user's question, or empty string if none." },
+  } } };
+  let j = null;
+  for (let attempt = 0; attempt < 2 && !j; attempt++) {
+    const res = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: ANTHROPIC_MODEL, max_tokens: 3000, system, tools: [tool], tool_choice: { type: 'tool', name: tool.name }, messages: [{ role: 'user', content: userText }] }) });
+    if (!res.ok) { console.error('explain model', res.status); continue; }
+    const data = await res.json();
+    const call = (data.content || []).find(b => b.type === 'tool_use' && b.name === tool.name);
+    if (call && call.input && typeof call.input === 'object') j = call.input; else console.error('explain: no tool output, stop_reason', data.stop_reason);
+  }
+  if (!j) throw new Error('no explanation');
   const str = v => String(v || '');
   return {
     headline: str(j.headline), summary: str(j.summary), answer: str(j.answer),
@@ -679,7 +699,9 @@ const server = http.createServer(async (req, res) => {
         if (!ANTHROPIC_API_KEY) return json(res, 503, { error: 'ANTHROPIC_API_KEY not set' });
         const usage = await getUsage(deviceId);
         if (usage.textCount >= EXPLAIN_DAILY_LIMIT) return json(res, 429, { error: 'daily limit', detail: `You've reached today's limit of ${EXPLAIN_DAILY_LIMIT} portfolio explanations. It resets at midnight Eastern.` });
-        const out = await explainPortfolio(user, body.question);
+        let out;
+        try { out = await explainPortfolio(user, body.question); }
+        catch (e) { console.error('explain failed', e.message); return json(res, 502, { error: 'explain failed', detail: 'Couldn’t get an explanation right now. Please try again in a moment.' }); }
         await bumpUsage(deviceId, false);
         return json(res, 200, out);
       }
