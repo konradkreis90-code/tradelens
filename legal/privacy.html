@@ -26,7 +26,7 @@
 <tr><td><b>Anonymous app ID</b> — a random code created when you install Peekline. It is not linked to your name, email, or phone number.</td><td>To keep your analyses, usage limits, subscription, and brokerage connection tied to your install.</td><td>Our server; RevenueCat; SnapTrade (if you connect a brokerage).</td></tr>
 <tr><td><b>Chart images</b> you upload, photograph, or capture in the app, plus the ticker, price, time horizon, and trading strategy you choose.</td><td>To produce the analysis you asked for.</td><td>Our server passes it to our AI provider, Anthropic, and returns the result. We do not save your images or analyses on our server; your analysis history is kept only on your phone.</td></tr>
 <tr><td><b>Usage counts</b> — how many analyses you have run today.</td><td>To apply the free-analysis limit and the fair-use limit of 25 image analyses per day.</td><td>Our server.</td></tr>
-<tr><td><b>Brokerage data</b> (only if you choose to connect) — account names, positions, cost basis, and past trades.</td><td>To show your positions and grade your closed trades.</td><td>Fetched live from SnapTrade each time you open these screens and not saved on our server. To grade trades, the trade details (ticker, share count, entry and exit prices and dates) are sent to Anthropic. We store only the connection's ID and access key, never your broker login.</td></tr>
+<tr><td><b>Brokerage data</b> (only if you choose to connect) — account names, balances (total value, cash, buying power), account value history and returns, positions and cost basis, orders, and account activity such as trades, dividends, deposits, and withdrawals.</td><td>To show your portfolio, orders, and activity, grade your closed trades, and explain your portfolio when you ask.</td><td>Fetched live from SnapTrade when you open these screens and not saved to our database (our server keeps it in memory for a few minutes so screens load quickly). To grade trades, the trade details (ticker, share count, entry and exit prices and dates) are sent to Anthropic. When you use <b>Explain my portfolio</b>, your holdings, balances, returns, and your question are sent to Anthropic. The ticker symbols you hold are sent to Finnhub to look up sectors, earnings dates, and headlines. We store only the connection's ID and access key, never your broker login.</td></tr>
 <tr><td><b>Purchase information</b> — which plan you have and when it renews. We never see your card or Apple ID details; Apple handles payment.</td><td>To unlock Peekline Pro.</td><td>Apple and RevenueCat.</td></tr>
 </table>
 
@@ -35,10 +35,10 @@
 
 <h2>2. Services we use</h2>
 <ul>
-<li><b>Anthropic</b> — AI analysis of chart images and grading of closed trades. Anthropic processes the data to return a result; under its commercial terms it does not use this data to train its models.</li>
+<li><b>Anthropic</b> — AI analysis of chart images, grading of closed trades, and portfolio explanations. Anthropic processes the data to return a result; under its commercial terms it does not use this data to train its models.</li>
 <li><b>SnapTrade</b> (by Passiv) — the secure, read-only connection to your brokerage. SnapTrade's own privacy policy applies to the login and data it handles.</li>
 <li><b>RevenueCat</b> — manages subscriptions on top of Apple's App Store.</li>
-<li><b>Finnhub</b> — market prices. No personal data is sent.</li>
+<li><b>Finnhub</b> — market prices, sectors, earnings dates, and headlines. Only ticker symbols are sent, never your name, account, or amounts.</li>
 <li><b>TradingView</b> — the interactive chart on the Chart tab is TradingView's widget and is subject to TradingView's policies.</li>
 <li><b>Railway</b> — hosts our server and database.</li>
 </ul>
@@ -48,7 +48,7 @@
 
 <h2>4. How long we keep data</h2>
 <ul>
-<li><b>Chart images, analyses, positions, and trades:</b> not stored on our server.</li>
+<li><b>Chart images, analyses, and brokerage data (balances, positions, orders, activity):</b> not stored in our database; brokerage data is held in server memory for at most about 10 minutes.</li>
 <li><b>Daily analysis counts:</b> deleted automatically after 90 days.</li>
 <li><b>Your app ID:</b> kept while you use Peekline, so your connection and limits keep working. Ask us to delete it any time.</li>
 <li><b>Brokerage connection:</b> kept until you disconnect. Disconnecting deletes your SnapTrade user and the stored access key.</li>

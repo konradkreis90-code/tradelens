@@ -24,6 +24,7 @@ const DATABASE_URL = process.env.DATABASE_URL;
 // Shared secret the app must send (header x-peekline-key). Set APP_SECRET in Railway; leave unset while developing.
 const APP_SECRET = process.env.APP_SECRET || null;
 const DAILY_IMAGE_LIMIT = Number(process.env.DAILY_IMAGE_LIMIT || 25); // fair-use cap on chart-image analyses per device per day
+const EXPLAIN_DAILY_LIMIT = Number(process.env.EXPLAIN_DAILY_LIMIT || 30); // "Explain my portfolio" requests per device per day (text_count)
 // Universe for "Top stocks of the day": the most-traded US names. Refreshed every 5 min within Finnhub's rate limit.
 const MOVERS_UNIVERSE = ['NVDA','TSLA','AAPL','AMD','PLTR','META','AMZN','MSFT','GOOGL','COIN','NBIS','SOFI','HOOD','MSTR','AVGO','NFLX','INTC','SMCI','MU','ARM','UBER','SHOP','CRWD','PANW','SNOW','RIVN','LCID','NIO','BABA','JPM','BAC','XOM','CVX','WMT','COST','DIS','BA','PFE','MRNA','LLY','UNH','V','MA','PYPL','SQ','SPY','QQQ','IWM','GLD','TLT'];
 
@@ -127,8 +128,18 @@ async function accountPositions(user, accountId) {
     async () => { const r = await snap.accountInformation.getUserAccountPositions({ ...creds(user), accountId }); return r.data || []; },
   ]);
 }
+// Short in-memory cache (never written to the database) so one screen load doesn't hit SnapTrade twice.
+const briefCache = new Map(); // key -> { at, data }
+async function cached(key, ms, fn) {
+  const c = briefCache.get(key); if (c && Date.now() - c.at < ms) return c.data;
+  const data = await fn(); briefCache.set(key, { at: Date.now(), data }); return data;
+}
+setInterval(() => { const now = Date.now(); for (const [k, v] of briefCache) if (now - v.at > 10 * 60e3) briefCache.delete(k); }, 5 * 60e3);
+function forgetUser(deviceId) { for (const k of briefCache.keys()) if (k.startsWith(deviceId + ':')) briefCache.delete(k); }
+const listAccounts = user => cached(`${user.device_id}:accounts`, 60e3, async () => (await snap.accountInformation.listUserAccounts(creds(user))).data || []);
+
 async function listPositions(user) {
-  const accts = (await snap.accountInformation.listUserAccounts(creds(user))).data || [];
+  const accts = await listAccounts(user);
   // Privacy: log counts and types only, never account numbers, holdings, or prices.
   console.log('accounts:', accts.length, JSON.stringify(accts.map(a => ({ type: a.meta?.type || a.raw_type || null, sync: a.sync_status || null }))).slice(0, 300));
   const out = [];
@@ -153,10 +164,12 @@ async function listPositions(user) {
   return { accounts: accts.map(a => ({ id: a.id, name: a.name || '', institution: a.institution_name || '' })), positions: [...merged.values()] };
 }
 
-async function listTrades(user, days = 730) {
+const HISTORY_DAYS = 730;
+const accountActivities = user => cached(`${user.device_id}:activities`, 120e3, () => fetchActivities(user));
+async function fetchActivities(user, days = HISTORY_DAYS) {
   const end = new Date(), start = new Date(Date.now() - days * 86400000);
   const fmt = d => d.toISOString().slice(0, 10);
-  const accts = (await snap.accountInformation.listUserAccounts(creds(user))).data || [];
+  const accts = await listAccounts(user);
   let acts = [];
   for (const a of accts) {
     // Per-account activities (the older all-accounts endpoint returns 410 Gone).
@@ -169,8 +182,14 @@ async function listTrades(user, days = 730) {
     } catch (e) { console.error('activities', a.id, e.response?.status, e.message); }
   }
   console.log(`activities: ${acts.length} raw across ${accts.length} account(s); types: ${[...new Set(acts.map(a => a.type))].join(',') || 'none'}`, acts.length ? '| sample keys: ' + Object.keys(acts[0]).join(',') : '');
+  return acts;
+}
+const actSymbol = a => String(a.instrument?.symbol || a.symbol?.symbol || a.symbol?.raw_symbol || (typeof a.symbol === 'string' ? a.symbol : '') || a.option_symbol?.ticker || '').toUpperCase();
+
+async function listTrades(user) {
+  const acts = await accountActivities(user);
   const fills = acts.filter(a => ['BUY', 'SELL'].includes(String(a.type || '').toUpperCase()) && a.units && a.price)
-    .map(a => ({ symbol: String(a.instrument?.symbol || a.symbol?.symbol || a.symbol?.raw_symbol || (typeof a.symbol === 'string' ? a.symbol : '') || a.option_symbol?.ticker || '').toUpperCase(), side: String(a.type).toUpperCase(), qty: Math.abs(Number(a.units)), price: Number(a.price), date: (a.trade_date || a.settlement_date || '').slice(0, 10) }))
+    .map(a => ({ symbol: actSymbol(a), side: String(a.type).toUpperCase(), qty: Math.abs(Number(a.units)), price: Number(a.price), date: (a.trade_date || a.settlement_date || '').slice(0, 10) }))
     .filter(f => f.symbol && f.qty > 0 && f.price > 0).sort((x, y) => x.date < y.date ? -1 : 1);
   // FIFO pairing into closed trades
   const open = new Map(), closed = [];
@@ -187,7 +206,10 @@ async function listTrades(user, days = 730) {
     if (left > 0) closed.push({ symbol: f.symbol, side: 'Long', qty: left, entry: null, exit: f.price, entryDate: null, exitDate: f.date, plPct: null, note: 'Bought before available history' });
   }
   console.log(`trades: ${fills.length} fills -> ${closed.length} closed (${closed.filter(c => c.entry == null).length} without a visible buy)`);
-  return { fills, closed: closed.sort((a, b) => a.exitDate < b.exitDate ? 1 : -1).slice(0, 30) };
+  // Realized P/L only from trades where both the buy and the sell are visible.
+  const known = closed.filter(c => c.entry != null);
+  const realized = { amount: known.reduce((s, c) => s + (c.exit - c.entry) * c.qty, 0), trades: known.length, unknownEntry: closed.length - known.length, sinceDays: HISTORY_DAYS };
+  return { fills, closed: closed.sort((a, b) => a.exitDate < b.exitDate ? 1 : -1).slice(0, 30), realized };
 }
 
 async function gradeTrades(closed) {
@@ -202,6 +224,174 @@ async function gradeTrades(closed) {
   catch (e) { console.error('grade parse failed:', e.message, '| stop_reason:', data.stop_reason); return closed.map(t => ({ ...t, grade: null, why: '' })); }
   const by = new Map((j.grades || []).map(g => [g.i, g]));
   return closed.map((t, i) => ({ ...t, grade: ['A', 'B', 'C'].includes(by.get(i)?.grade) ? by.get(i).grade : null, why: String(by.get(i)?.why || '') }));
+}
+
+// ---------------------------------------------------------------------------
+// Portfolio (read-only): balances, value history, returns, orders, activity, AI explain.
+// Everything is fetched live from SnapTrade/Finnhub and never written to the database.
+// ---------------------------------------------------------------------------
+const nz = v => (v == null || v === '' || !isFinite(Number(v)) ? null : Number(v));
+const isoDay = (daysFromNow = 0) => new Date(Date.now() + daysFromNow * 86400000).toISOString().slice(0, 10);
+
+async function accountSummaries(user) {
+  const accts = await listAccounts(user);
+  return Promise.all(accts.map(async a => {
+    const currency = a.balance?.total?.currency || 'USD';
+    let cash = null, buyingPower = null;
+    try {
+      const b = (await snap.accountInformation.getUserAccountBalance({ ...creds(user), accountId: a.id })).data || [];
+      const row = b.find(x => (x.currency?.code || '') === currency) || b[0];
+      if (row) { cash = nz(row.cash); buyingPower = nz(row.buying_power); }
+    } catch (e) { console.log('balance unavailable', e.response?.status); }
+    return { id: a.id, name: a.name || '', institution: a.institution_name || '', total: nz(a.balance?.total?.amount), cash, buyingPower, currency };
+  }));
+}
+const sumOrNull = xs => (xs.length && xs.every(v => v != null) ? xs.reduce((s, v) => s + v, 0) : null);
+
+// Daily account value. With several accounts, only days where every account has a value are summed.
+async function valueHistory(user, accts) {
+  const byDate = new Map();
+  for (const a of accts) {
+    try {
+      const h = (await snap.accountInformation.getAccountBalanceHistory({ ...creds(user), accountId: a.id })).data?.history || [];
+      for (const p of h) { const v = nz(p.total_value), d = String(p.date || '').slice(0, 10); if (v == null || !d) continue; const e = byDate.get(d) || { value: 0, n: 0 }; e.value += v; e.n++; byDate.set(d, e); }
+    } catch (e) { console.log('value history unavailable', e.response?.status); return []; }
+  }
+  return [...byDate.entries()].filter(([, e]) => e.n === accts.length).sort(([a], [b]) => (a < b ? -1 : 1)).map(([date, e]) => ({ date, value: Math.round(e.value * 100) / 100 }));
+}
+async function returnRates(user, accountId) {
+  try {
+    const d = (await snap.accountInformation.getUserAccountReturnRates({ ...creds(user), accountId })).data?.data || [];
+    const out = {}; for (const r of d) if (r.timeframe && typeof r.return_percent === 'number') out[r.timeframe] = r.return_percent;
+    return Object.keys(out).length ? out : null;
+  } catch (e) { console.log('return rates unavailable', e.response?.status); return null; }
+}
+
+const OPEN_ORDER = new Set(['PENDING', 'ACCEPTED', 'PARTIAL', 'CANCEL_PENDING', 'REPLACE_PENDING', 'QUEUED', 'TRIGGERED', 'ACTIVATED', 'PENDING_RISK_REVIEW', 'CONTINGENT_ORDER']);
+async function listOrders(user) {
+  const accts = await listAccounts(user), out = [];
+  for (const a of accts) {
+    try {
+      const r = await snap.accountInformation.getUserAccountOrders({ ...creds(user), accountId: a.id, state: 'all', days: 90 });
+      for (const o of r.data || []) out.push({
+        symbol: String(o.universal_symbol?.symbol || o.option_symbol?.ticker || o.quote_universal_symbol?.symbol || '').toUpperCase(),
+        action: String(o.action || '').toUpperCase(), type: String(o.order_type || ''), status: String(o.status || ''),
+        qty: nz(o.total_quantity), filled: nz(o.filled_quantity), limit: nz(o.limit_price), stop: nz(o.stop_price), price: nz(o.execution_price),
+        tif: String(o.time_in_force || ''), placed: o.time_placed || null, updated: o.time_updated || o.time_executed || null,
+        account: a.name || a.institution_name || '', option: !!o.option_symbol,
+      });
+    } catch (e) { console.error('orders', e.response?.status, e.message); }
+  }
+  out.sort((x, y) => String(y.placed || '').localeCompare(String(x.placed || '')));
+  return { open: out.filter(o => OPEN_ORDER.has(o.status)), history: out.filter(o => !OPEN_ORDER.has(o.status)).slice(0, 60) };
+}
+
+async function activitySummary(user) {
+  const acts = await accountActivities(user);
+  const items = acts.map(a => ({
+    date: String(a.trade_date || a.settlement_date || '').slice(0, 10), type: String(a.type || '').toUpperCase(), symbol: actSymbol(a),
+    amount: nz(a.amount), units: nz(a.units), price: nz(a.price), description: String(a.description || '').slice(0, 120),
+  })).filter(x => x.date).sort((x, y) => (x.date < y.date ? 1 : -1));
+  const yearAgo = isoDay(-365);
+  const divs = items.filter(i => i.type === 'DIVIDEND');
+  return { items: items.slice(0, 120), dividends: { last12m: divs.filter(d => d.date >= yearAgo).reduce((s, d) => s + (d.amount || 0), 0), items: divs.slice(0, 40) }, sinceDays: HISTORY_DAYS };
+}
+
+// Market context from Finnhub (not user data; cached in memory).
+const sectorCache = new Map(), quoteCache = new Map(), newsCache = new Map();
+let earningsCache = { at: 0, list: [] };
+async function sectorOf(sym) {
+  const c = sectorCache.get(sym); if (c && Date.now() - c.at < 24 * 3600e3) return c.sector;
+  try {
+    const j = await (await fetch(`https://finnhub.io/api/v1/stock/profile2?symbol=${encodeURIComponent(sym)}&token=${FINNHUB_KEY}`)).json();
+    const sector = j && j.finnhubIndustry ? String(j.finnhubIndustry) : 'Unclassified';
+    sectorCache.set(sym, { at: Date.now(), sector }); return sector;
+  } catch { return 'Unclassified'; }
+}
+async function quoteOf(sym) {
+  const c = quoteCache.get(sym); if (c && Date.now() - c.at < 60e3) return c.q;
+  try {
+    const j = await (await fetch(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(sym)}&token=${FINNHUB_KEY}`)).json();
+    const q = typeof j.c === 'number' && j.c > 0 ? { price: j.c, prevClose: j.pc, changePct: j.dp } : null;
+    quoteCache.set(sym, { at: Date.now(), q }); return q;
+  } catch { return null; }
+}
+async function upcomingEarnings(symbols) {
+  if (Date.now() - earningsCache.at > 6 * 3600e3) {
+    try {
+      const j = await (await fetch(`https://finnhub.io/api/v1/calendar/earnings?from=${isoDay()}&to=${isoDay(30)}&token=${FINNHUB_KEY}`)).json();
+      earningsCache = { at: Date.now(), list: (j.earningsCalendar || []).map(e => ({ symbol: String(e.symbol || '').toUpperCase(), date: e.date, hour: e.hour || '', epsEstimate: nz(e.epsEstimate) })) };
+    } catch (e) { console.log('earnings calendar unavailable', e.message); }
+  }
+  const want = new Set(symbols);
+  return earningsCache.list.filter(e => want.has(e.symbol)).sort((a, b) => (a.date < b.date ? -1 : 1));
+}
+async function headlines(sym) {
+  const c = newsCache.get(sym); if (c && Date.now() - c.at < 30 * 60e3) return c.list;
+  try {
+    const j = await (await fetch(`https://finnhub.io/api/v1/company-news?symbol=${encodeURIComponent(sym)}&from=${isoDay(-3)}&to=${isoDay()}&token=${FINNHUB_KEY}`)).json();
+    const list = (Array.isArray(j) ? j : []).slice(0, 3).map(n => ({ headline: String(n.headline || '').slice(0, 160), source: String(n.source || ''), date: n.datetime ? new Date(n.datetime * 1000).toISOString().slice(0, 10) : '' })).filter(n => n.headline);
+    newsCache.set(sym, { at: Date.now(), list }); return list;
+  } catch { return []; }
+}
+
+async function portfolioOverview(user) {
+  const [accounts, pos] = await Promise.all([accountSummaries(user), listPositions(user)]);
+  const symbols = pos.positions.map(p => p.symbol);
+  const [sectorList, history, returns, earnings, trades] = await Promise.all([
+    Promise.all(symbols.slice(0, 30).map(sectorOf)),
+    valueHistory(user, accounts),
+    accounts.length === 1 ? returnRates(user, accounts[0].id) : Promise.resolve(null),
+    upcomingEarnings(symbols).catch(() => []),
+    listTrades(user).catch(() => null),
+  ]);
+  const sectors = {}; symbols.slice(0, 30).forEach((s, i) => { sectors[s] = sectorList[i]; });
+  return {
+    connected: accounts.length > 0, broker: accounts[0]?.institution || user.broker_name || null,
+    accounts, totals: { value: sumOrNull(accounts.map(a => a.total)), cash: sumOrNull(accounts.map(a => a.cash)), buyingPower: sumOrNull(accounts.map(a => a.buyingPower)), currency: accounts[0]?.currency || 'USD' },
+    positions: pos.positions, sectors, history, returns, earnings, realized: trades?.realized || null,
+  };
+}
+
+async function explainPortfolio(user, question) {
+  const ov = await portfolioOverview(user);
+  // Live quotes for the 30 largest holdings (Finnhub rate limit); the rest use the broker's price.
+  const byEstValue = [...ov.positions].sort((a, b) => (b.brokerPrice || 0) * b.qty - (a.brokerPrice || 0) * a.qty);
+  const quoted = new Set(byEstValue.slice(0, 30).map(p => p.symbol));
+  const rows = await Promise.all(ov.positions.map(async p => {
+    const q = quoted.has(p.symbol) ? await quoteOf(p.symbol) : null; const price = q?.price ?? p.brokerPrice;
+    return { ...p, price, prevClose: q?.prevClose ?? null, value: price != null ? price * p.qty : null };
+  }));
+  const invested = rows.reduce((s, r) => s + (r.value || 0), 0);
+  const top = rows.filter(r => r.value != null).sort((a, b) => b.value - a.value);
+  const spy = await quoteOf('SPY');
+  const news = {}; for (const r of top.slice(0, 3)) news[r.symbol] = await headlines(r.symbol);
+  const f = (v, d = 2) => (v == null ? 'n/a' : Number(v).toFixed(d));
+  const lines = top.slice(0, 25).map(r => `${r.symbol} | sector ${ov.sectors[r.symbol] || 'n/a'} | ${r.qty} sh | price ${f(r.price)} | prev close ${f(r.prevClose)} | value ${f(r.value, 0)} | weight ${invested ? f(r.value / invested * 100, 1) : 'n/a'}% | avg cost ${f(r.avgCost)} | unrealized ${r.avgCost != null && r.price != null ? f((r.price - r.avgCost) * r.qty, 0) : 'n/a'} | today ${r.prevClose ? f((r.price - r.prevClose) * r.qty, 0) + ' (' + f((r.price / r.prevClose - 1) * 100) + '%)' : 'n/a'}`);
+  const context = [
+    `Account total value: ${f(ov.totals.value, 0)} ${ov.totals.currency}. Cash: ${f(ov.totals.cash, 0)}. Buying power: ${f(ov.totals.buyingPower, 0)}. Invested in listed holdings: ${f(invested, 0)}.`,
+    `Holdings (largest first):\n${lines.join('\n') || 'none'}`,
+    `S&P 500 proxy (SPY) today: ${spy?.changePct != null ? f(spy.changePct) + '%' : 'n/a'}.`,
+    ov.returns ? `Account returns: ${Object.entries(ov.returns).map(([k, v]) => `${k} ${f(v)}%`).join(', ')}.` : 'Account returns: not available.',
+    ov.realized ? `Realized P/L from closed trades visible in the last ${ov.realized.sinceDays} days: ${f(ov.realized.amount, 0)} over ${ov.realized.trades} trades.` : '',
+    `Upcoming earnings (30 days) for holdings: ${ov.earnings.map(e => `${e.symbol} ${e.date}${e.hour ? ' ' + e.hour : ''}`).join(', ') || 'none found'}.`,
+    `Recent headlines:\n${Object.entries(news).map(([s, l]) => l.map(n => `${s}: ${n.headline} (${n.source}, ${n.date})`).join('\n')).filter(Boolean).join('\n') || 'none'}`,
+  ].filter(Boolean).join('\n\n');
+  const system = `You explain a retail investor's brokerage portfolio in plain English for education. Use ONLY the numbers and facts provided; never invent prices, news, or events, and say when data is missing. Point out concentration (single holdings over ~20% or sectors over ~35% of invested value), big winners/losers, what drove today's change, upcoming earnings, and how the day compares with SPY. Be balanced and humble; this is not financial advice and you must not tell the user to buy or sell.
+Return ONLY JSON: {"headline": string (one sentence with today's move and the biggest driver), "summary": string (3-5 sentences), "points": [string] (3-6 short bullets), "scenarios": [{"name": "If the market rises"|"If the market falls"|"If <holding> reports earnings", "text": string}] (2-3 items, describe exposure only, no predictions), "answer": string (answer to the user's question, or "" if none)}`;
+  const userText = `${context}${question ? `\n\nUser's question: ${String(question).slice(0, 300)}` : ''}`;
+  const res = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({ model: ANTHROPIC_MODEL, max_tokens: 1800, system, messages: [{ role: 'user', content: userText }] }) });
+  if (!res.ok) throw new Error(`model ${res.status}`);
+  const data = await res.json(); const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+  const j = JSON.parse(text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1));
+  const str = v => String(v || '');
+  return {
+    headline: str(j.headline), summary: str(j.summary), answer: str(j.answer),
+    points: (Array.isArray(j.points) ? j.points : []).slice(0, 6).map(str).filter(Boolean),
+    scenarios: (Array.isArray(j.scenarios) ? j.scenarios : []).slice(0, 3).map(s => ({ name: str(s?.name), text: str(s?.text) })).filter(s => s.text),
+    at: Date.now(), engine: ANTHROPIC_MODEL,
+  };
 }
 
 let brokerListCache = { at: 0, data: [] };
@@ -472,9 +662,31 @@ const server = http.createServer(async (req, res) => {
         const graded = url.searchParams.get('grade') === '1' ? await gradeTrades(closed) : closed.map(t => ({ ...t, grade: null, why: '' }));
         return json(res, 200, { closed: graded });
       }
+      if (url.pathname === '/brokerage/overview') {
+        if (!user.snap_user_id) return json(res, 200, { connected: false });
+        return json(res, 200, await portfolioOverview(user));
+      }
+      if (url.pathname === '/brokerage/orders') {
+        if (!user.snap_user_id) return json(res, 200, { open: [], history: [] });
+        return json(res, 200, await listOrders(user));
+      }
+      if (url.pathname === '/brokerage/activity') {
+        if (!user.snap_user_id) return json(res, 200, { items: [], dividends: { last12m: 0, items: [] } });
+        return json(res, 200, await activitySummary(user));
+      }
+      if (url.pathname === '/brokerage/explain' && req.method === 'POST') {
+        if (!user.snap_user_id) return json(res, 400, { error: 'no brokerage connected' });
+        if (!ANTHROPIC_API_KEY) return json(res, 503, { error: 'ANTHROPIC_API_KEY not set' });
+        const usage = await getUsage(deviceId);
+        if (usage.textCount >= EXPLAIN_DAILY_LIMIT) return json(res, 429, { error: 'daily limit', detail: `You've reached today's limit of ${EXPLAIN_DAILY_LIMIT} portfolio explanations. It resets at midnight Eastern.` });
+        const out = await explainPortfolio(user, body.question);
+        await bumpUsage(deviceId, false);
+        return json(res, 200, out);
+      }
       if (url.pathname === '/brokerage/disconnect' && req.method === 'POST') {
         if (user.snap_user_id) { try { await snap.authentication.deleteSnapTradeUser(creds(user)); } catch (e) { console.error('snap delete', e.message); } }
         await db.query('UPDATE users SET snap_user_id=NULL, snap_user_secret=NULL, broker_name=NULL, connected_at=NULL WHERE device_id=$1', [deviceId]);
+        forgetUser(deviceId);
         return json(res, 200, { ok: true });
       }
       return json(res, 404, { error: 'not found' });
