@@ -24,7 +24,15 @@ const DATABASE_URL = process.env.DATABASE_URL;
 // Shared secret the app must send (header x-peekline-key). Set APP_SECRET in Railway; leave unset while developing.
 const APP_SECRET = process.env.APP_SECRET || null;
 const DAILY_IMAGE_LIMIT = Number(process.env.DAILY_IMAGE_LIMIT || 25); // fair-use cap on chart-image analyses per device per day
-const EXPLAIN_DAILY_LIMIT = Number(process.env.EXPLAIN_DAILY_LIMIT || 30); // "Explain my portfolio" requests per device per day (text_count)
+const EXPLAIN_DAILY_LIMIT = Number(process.env.EXPLAIN_DAILY_LIMIT || 30); // "Explain my portfolio" requests per device per day (paid mode)
+// FREE BETA switch. On unless the Railway variable FREE_BETA is 0/false/off: everything is unlocked for everyone,
+// with strict daily limits to keep AI costs small, and the app shows a Pro waitlist instead of the paywall.
+// To start charging: set FREE_BETA=0 in Railway. The app reads the switch from GET /config when it opens.
+const FREE_BETA = !['0', 'false', 'off', 'no'].includes(String(process.env.FREE_BETA ?? '1').trim().toLowerCase());
+const BETA_DAILY_ANALYSES = Number(process.env.BETA_DAILY_ANALYSES || 3); // chart/holding analyses (with or without image)
+const BETA_DAILY_EXPLAINS = Number(process.env.BETA_DAILY_EXPLAINS || 3); // "Explain my portfolio"
+const BETA_DAILY_GRADES = Number(process.env.BETA_DAILY_GRADES || 3);     // trade-grading runs
+console.log('free beta:', FREE_BETA ? `ON (limits ${BETA_DAILY_ANALYSES}/${BETA_DAILY_EXPLAINS}/${BETA_DAILY_GRADES} per day)` : 'off');
 // Universe for "Top stocks of the day": the most-traded US names. Refreshed every 5 min within Finnhub's rate limit.
 const MOVERS_UNIVERSE = ['NVDA','TSLA','AAPL','AMD','PLTR','META','AMZN','MSFT','GOOGL','COIN','NBIS','SOFI','HOOD','MSTR','AVGO','NFLX','INTC','SMCI','MU','ARM','UBER','SHOP','CRWD','PANW','SNOW','RIVN','LCID','NIO','BABA','JPM','BAC','XOM','CVX','WMT','COST','DIS','BA','PFE','MRNA','LLY','UNH','V','MA','PYPL','SQ','SPY','QQQ','IWM','GLD','TLT'];
 
@@ -44,6 +52,12 @@ async function initDb() {
     device_id TEXT NOT NULL, day DATE NOT NULL, image_count INT NOT NULL DEFAULT 0, text_count INT NOT NULL DEFAULT 0,
     PRIMARY KEY (device_id, day)
   )`);
+  await db.query(`ALTER TABLE usage ADD COLUMN IF NOT EXISTS explain_count INT NOT NULL DEFAULT 0`);
+  await db.query(`ALTER TABLE usage ADD COLUMN IF NOT EXISTS grade_count INT NOT NULL DEFAULT 0`);
+  // Pro waitlist (free beta): only the email the person typed, so we can tell them when Pro launches.
+  await db.query(`CREATE TABLE IF NOT EXISTS waitlist (
+    email TEXT PRIMARY KEY, device_id TEXT, created_at TIMESTAMPTZ DEFAULT now()
+  )`);
   console.log('db ready');
   pruneUsage(); setInterval(pruneUsage, 24 * 3600e3);
 }
@@ -54,12 +68,16 @@ function pruneUsage() {
     .catch(e => console.error('prune usage failed', e.message));
 }
 async function getUsage(deviceId) {
-  const r = await db.query(`SELECT image_count, text_count FROM usage WHERE device_id=$1 AND day=(now() AT TIME ZONE 'America/New_York')::date`, [deviceId]);
-  const row = r.rows[0] || { image_count: 0, text_count: 0 };
-  return { imageCount: row.image_count, textCount: row.text_count, limit: DAILY_IMAGE_LIMIT, remaining: Math.max(0, DAILY_IMAGE_LIMIT - row.image_count) };
+  const r = await db.query(`SELECT image_count, text_count, explain_count, grade_count FROM usage WHERE device_id=$1 AND day=(now() AT TIME ZONE 'America/New_York')::date`, [deviceId]);
+  const row = r.rows[0] || { image_count: 0, text_count: 0, explain_count: 0, grade_count: 0 };
+  // Beta: every analysis counts (with or without an image). Paid: only image analyses count toward fair use.
+  const used = FREE_BETA ? row.image_count + row.text_count : row.image_count;
+  const limit = FREE_BETA ? BETA_DAILY_ANALYSES : DAILY_IMAGE_LIMIT;
+  return { imageCount: row.image_count, textCount: row.text_count, explainCount: row.explain_count || 0, gradeCount: row.grade_count || 0, limit, remaining: Math.max(0, limit - used), beta: FREE_BETA };
 }
-async function bumpUsage(deviceId, withImage) {
-  const col = withImage ? 'image_count' : 'text_count';
+const USAGE_COL = { image: 'image_count', text: 'text_count', explain: 'explain_count', grade: 'grade_count' };
+async function bumpUsage(deviceId, kind) {
+  const col = USAGE_COL[kind]; if (!col) throw new Error('bad usage kind');
   await db.query(`INSERT INTO usage(device_id, day, ${col}) VALUES($1, (now() AT TIME ZONE 'America/New_York')::date, 1)
     ON CONFLICT (device_id, day) DO UPDATE SET ${col} = usage.${col} + 1`, [deviceId]);
 }
@@ -644,8 +662,22 @@ const server = http.createServer(async (req, res) => {
   const page = PAGES[url.pathname.replace(/^\/|\.html$|\/$/g, '')];
   if (req.method === 'GET' && page) { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=300' }); return res.end(page); }
   // ---- app secret (all app-only routes) ----
-  const appOnly = url.pathname.startsWith('/brokerage/') || url.pathname === '/me' || url.pathname === '/analyze' || url.pathname === '/movers';
+  const appOnly = url.pathname.startsWith('/brokerage/') || url.pathname === '/me' || url.pathname === '/analyze' || url.pathname === '/movers' || url.pathname === '/waitlist';
   if (appOnly && APP_SECRET && req.headers['x-peekline-key'] !== APP_SECRET) return json(res, 401, { error: 'unauthorized' });
+
+  // What mode the app should run in. Public and read-only.
+  if (url.pathname === '/config') {
+    res.setHeader('Cache-Control', 'no-store');
+    return json(res, 200, { freeBeta: FREE_BETA, limits: FREE_BETA ? { analyses: BETA_DAILY_ANALYSES, explains: BETA_DAILY_EXPLAINS, grades: BETA_DAILY_GRADES } : null });
+  }
+  if (url.pathname === '/waitlist' && req.method === 'POST') {
+    if (!db) return json(res, 503, { error: 'database not configured' });
+    let body; try { body = JSON.parse(await readBody(req, 1e4) || '{}'); } catch { return json(res, 400, { error: 'bad json' }); }
+    const email = String(body.email || '').trim().toLowerCase();
+    if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) return json(res, 400, { error: 'invalid email', detail: 'Please enter a valid email address.' });
+    await db.query('INSERT INTO waitlist(email, device_id) VALUES($1, $2) ON CONFLICT (email) DO NOTHING', [email, isDeviceId(body.deviceId) ? body.deviceId : null]);
+    return json(res, 200, { ok: true });
+  }
 
   if (url.pathname === '/usage') {
     const deviceId = url.searchParams.get('deviceId');
@@ -684,7 +716,15 @@ const server = http.createServer(async (req, res) => {
       if (url.pathname === '/brokerage/trades') {
         if (!user.snap_user_id) return json(res, 200, { closed: [] });
         const { closed } = await listTrades(user);
-        const graded = url.searchParams.get('grade') === '1' ? await gradeTrades(closed) : closed.map(t => ({ ...t, grade: null, why: '' }));
+        const ungraded = () => closed.map(t => ({ ...t, grade: null, why: '' }));
+        if (url.searchParams.get('grade') !== '1') return json(res, 200, { closed: ungraded() });
+        // Reuse a grading from the last 10 minutes so reopening the screen doesn't pay for (or count) a new one.
+        const key = `${deviceId}:grades`, hit = briefCache.get(key);
+        if (hit && Date.now() - hit.at < 10 * 60e3) return json(res, 200, { closed: hit.data });
+        if (FREE_BETA && (await getUsage(deviceId)).gradeCount >= BETA_DAILY_GRADES) return json(res, 200, { closed: ungraded(), gradeLimit: `You've used today's ${BETA_DAILY_GRADES} free beta trade reviews. They reset at midnight Eastern.` });
+        const graded = await gradeTrades(closed);
+        briefCache.set(key, { at: Date.now(), data: graded });
+        if (graded.some(t => t.grade)) await bumpUsage(deviceId, 'grade');
         return json(res, 200, { closed: graded });
       }
       if (url.pathname === '/brokerage/overview') {
@@ -702,12 +742,12 @@ const server = http.createServer(async (req, res) => {
       if (url.pathname === '/brokerage/explain' && req.method === 'POST') {
         if (!user.snap_user_id) return json(res, 400, { error: 'no brokerage connected' });
         if (!ANTHROPIC_API_KEY) return json(res, 503, { error: 'ANTHROPIC_API_KEY not set' });
-        const usage = await getUsage(deviceId);
-        if (usage.textCount >= EXPLAIN_DAILY_LIMIT) return json(res, 429, { error: 'daily limit', detail: `You've reached today's limit of ${EXPLAIN_DAILY_LIMIT} portfolio explanations. It resets at midnight Eastern.` });
+        const usage = await getUsage(deviceId), explainLimit = FREE_BETA ? BETA_DAILY_EXPLAINS : EXPLAIN_DAILY_LIMIT;
+        if (usage.explainCount >= explainLimit) return json(res, 429, { error: 'daily limit', detail: FREE_BETA ? `You've used today's ${explainLimit} free beta portfolio explanations. They reset at midnight Eastern.` : `You've reached today's limit of ${explainLimit} portfolio explanations. It resets at midnight Eastern.` });
         let out;
         try { out = await explainPortfolio(user, body.question); }
         catch (e) { console.error('explain failed', e.message); return json(res, 502, { error: 'explain failed', detail: 'Couldn’t get an explanation right now. Please try again in a moment.' }); }
-        await bumpUsage(deviceId, false);
+        await bumpUsage(deviceId, 'explain');
         return json(res, 200, out);
       }
       if (url.pathname === '/brokerage/disconnect' && req.method === 'POST') {
@@ -731,13 +771,15 @@ const server = http.createServer(async (req, res) => {
       if (!/^[A-Z0-9.\-]{1,12}$/.test(ticker) || !(price > 0)) { res.writeHead(400, {'Content-Type':'application/json'}); return res.end('{"error":"ticker and price required"}'); }
       const withImage = !!body.imageBase64; const deviceId = isDeviceId(body.deviceId) ? body.deviceId : null;
       let usage = null;
+      if (FREE_BETA && !(db && deviceId)) return json(res, 400, { error: 'deviceId required' }); // beta limits need an id
       if (db && deviceId) {
         usage = await getUsage(deviceId);
-        if (withImage && usage.remaining <= 0) return json(res, 429, { error: 'daily limit', detail: `You've reached today's fair-use limit of ${DAILY_IMAGE_LIMIT} chart analyses. It resets at midnight Eastern.`, usage });
+        if (FREE_BETA && usage.remaining <= 0) return json(res, 429, { error: 'daily limit', detail: `You've used today's ${BETA_DAILY_ANALYSES} free beta analyses. They reset at midnight Eastern.`, usage });
+        if (!FREE_BETA && withImage && usage.remaining <= 0) return json(res, 429, { error: 'daily limit', detail: `You've reached today's fair-use limit of ${DAILY_IMAGE_LIMIT} chart analyses. It resets at midnight Eastern.`, usage });
       }
       const st = body.strategy && typeof body.strategy === 'object' ? { name: String(body.strategy.name || '').slice(0, 60), style: String(body.strategy.style || '').slice(0, 40), trigger: String(body.strategy.trigger || '').slice(0, 120), stop: String(body.strategy.stop || '').slice(0, 120), target: String(body.strategy.target || '').slice(0, 120), notes: String(body.strategy.notes || '').slice(0, 300) } : null;
       const out = await analyzeChart({ ticker, price, changePct: body.changePct, horizon: body.horizon, imageBase64: body.imageBase64, mediaType: body.mediaType, strategy: st && st.name ? st : null });
-      if (db && deviceId) { await bumpUsage(deviceId, withImage); usage = await getUsage(deviceId); }
+      if (db && deviceId) { await bumpUsage(deviceId, withImage ? 'image' : 'text'); usage = await getUsage(deviceId); }
       res.writeHead(200, {'Content-Type':'application/json'}); return res.end(JSON.stringify({ ...out, usage }));
     } catch (e) {
       console.error('analyze failed', e.message);
