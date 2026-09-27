@@ -173,6 +173,10 @@ setInterval(() => { const now = Date.now(); for (const [k, v] of briefCache) if 
 function forgetUser(deviceId) { for (const k of briefCache.keys()) if (k.startsWith(deviceId + ':')) briefCache.delete(k); }
 const listAccounts = user => cached(`${user.device_id}:accounts`, 60e3, async () => (await snap.accountInformation.listUserAccounts(creds(user))).data || []);
 
+const isCryptoAsset = x => /crypto/i.test(String(x?.instrument?.kind || x?.instrument?.type || x?.symbol?.symbol?.type?.code || x?.symbol?.type?.code || x?.type || ''));
+// "BTC", "BTCUSD", "BTC-USD", "BTC/USDT" -> "BTC-USD" (the form Peekline prices from Coinbase).
+const cryptoSymbol = s => String(s).toUpperCase().replace(/[s/]/g, '').replace(/-?(USD|USDT|USDC)$/, '') + '-USD';
+
 async function listPositions(user) {
   const accts = await listAccounts(user);
   // Privacy: log counts and types only, never account numbers, holdings, or prices.
@@ -195,7 +199,8 @@ async function listPositions(user) {
       const lots = Array.isArray(p.tax_lots) ? p.tax_lots.filter(l => n(l.quantity) > 0 && n(l.purchased_price) != null) : [];
       const lotAvg = lots.length ? lots.reduce((s, l) => s + n(l.purchased_price) * n(l.quantity), 0) / lots.reduce((s, l) => s + n(l.quantity), 0) : null;
       const avgCost = n(p.average_purchase_price ?? p.average_cost ?? p.cost_basis_per_unit ?? p.cost_basis) ?? lotAvg;
-      out.push({ symbol: String(sym).toUpperCase(), qty, avgCost, brokerPrice: n(p.price ?? p.last_price), account: a.name || a.institution_name || '' });
+      const crypto = isCryptoAsset(p);
+      out.push({ symbol: crypto ? cryptoSymbol(sym) : String(sym).toUpperCase(), kind: crypto ? 'crypto' : 'stock', qty, avgCost, brokerPrice: n(p.price ?? p.last_price), account: a.name || a.institution_name || '' });
     }
   }
   if (!out.length) await refreshConnections(user); // empty holdings right after connecting usually means the broker sync hasn't run yet
@@ -224,7 +229,7 @@ async function fetchActivities(user, days = HISTORY_DAYS) {
   console.log(`activities: ${acts.length} raw across ${accts.length} account(s); types: ${[...new Set(acts.map(a => a.type))].join(',') || 'none'}`, acts.length ? '| sample keys: ' + Object.keys(acts[0]).join(',') : '');
   return acts;
 }
-const actSymbol = a => String(a.instrument?.symbol || a.symbol?.symbol || a.symbol?.raw_symbol || (typeof a.symbol === 'string' ? a.symbol : '') || a.option_symbol?.ticker || '').toUpperCase();
+const actSymbol = a => { const s = String(a.instrument?.symbol || a.symbol?.symbol || a.symbol?.raw_symbol || (typeof a.symbol === 'string' ? a.symbol : '') || a.option_symbol?.ticker || '').toUpperCase(); return s && isCryptoAsset(a) ? cryptoSymbol(s) : s; };
 
 async function listTrades(user) {
   const acts = await accountActivities(user);
@@ -344,6 +349,7 @@ async function activitySummary(user) {
 const sectorCache = new Map(), quoteCache = new Map(), newsCache = new Map();
 let earningsCache = { at: 0, list: [] };
 async function sectorOf(sym) {
+  if (isCrypto(sym)) return 'Crypto';
   const c = sectorCache.get(sym); if (c && Date.now() - c.at < 24 * 3600e3) return c.sector;
   try {
     const j = await (await fetch(`https://finnhub.io/api/v1/stock/profile2?symbol=${encodeURIComponent(sym)}&token=${FINNHUB_KEY}`)).json();
@@ -503,6 +509,18 @@ setInterval(moversTick, 6000); for (let i = 0; i < 5; i++) setTimeout(moversTick
 function moversList() {
   return [...moversCache.values()].filter(x => typeof x.changePct === 'number').sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct));
 }
+// Crypto movers: 20 popular coins on Coinbase (all checked Sept 27, 2026), 24h change. One coin every 15s = full
+// refresh every 5 minutes, well inside Coinbase's public limits.
+const CRYPTO_UNIVERSE = ['BTC','ETH','SOL','XRP','DOGE','ADA','AVAX','LINK','LTC','DOT','BCH','SHIB','UNI','XLM','AAVE','SUI','NEAR','HBAR','APT','PEPE'].map(s => s + '-USD');
+const cryptoMoversCache = new Map();
+let cryptoIdx = 0;
+async function cryptoMoversTick() {
+  const sym = CRYPTO_UNIVERSE[cryptoIdx++ % CRYPTO_UNIVERSE.length];
+  const q = await cryptoQuote(sym).catch(() => null);
+  if (q && typeof q.changePct === 'number') cryptoMoversCache.set(sym, { symbol: sym, price: q.price, prevClose: q.prevClose, changePct: q.changePct, at: Date.now() });
+}
+setInterval(cryptoMoversTick, 15000); for (let i = 0; i < 6; i++) setTimeout(cryptoMoversTick, 500 + i * 700);
+const cryptoMoversList = () => [...cryptoMoversCache.values()].sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct));
 
 function json(res, code, obj) { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); }
 
@@ -760,7 +778,7 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, await getUsage(deviceId));
   }
   if (url.pathname === '/movers') {
-    return json(res, 200, { asOf: Date.now(), universe: MOVERS_UNIVERSE.length, movers: moversList() });
+    return json(res, 200, { asOf: Date.now(), universe: MOVERS_UNIVERSE.length, movers: moversList(), cryptoUniverse: CRYPTO_UNIVERSE.length, crypto: cryptoMoversList() });
   }
   if (url.pathname === '/brokerage/list') {
     if (!snap) return json(res, 503, { error: 'SnapTrade keys not set' });
