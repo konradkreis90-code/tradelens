@@ -1,0 +1,18 @@
+{
+  "name": "Peekline",
+  "short_name": "Peekline",
+  "description": "Snap a stock chart and get trend, key levels, entry, targets, stop, and risk/reward in plain English — anchored to the live price. Free beta.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0f1726",
+  "theme_color": "#0f1726",
+  "icons": [
+    {
+      "src": "/icon.png",
+      "sizes": "1024x1024",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}

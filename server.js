@@ -507,7 +507,7 @@ function serveWeb(req, res, pathname) {
 
 // Public web pages the App Store needs: /privacy, /terms, /support (files in ./legal). Loaded once at startup.
 const PAGES = {};
-for (const name of ['privacy', 'terms', 'support']) {
+for (const name of ['privacy', 'terms', 'support', 'about']) {
   try { PAGES[name] = fs.readFileSync(path.join(__dirname, 'legal', `${name}.html`)); }
   catch (e) { console.error('missing page', name, e.message); }
 }
